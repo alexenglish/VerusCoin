@@ -2977,8 +2977,9 @@ CReserveTransactionDescriptor::CReserveTransactionDescriptor(const CTransaction 
                             checkState.RevertReservesAndSupply(ASSETCHAINS_CHAINID,
                                                                (importCurrencyDef.IsGatewayConverter() && importCurrencyDef.gatewayID == ASSETCHAINS_CHAINID) ||
                                                                     (!IsVerusActive() && importCurrencyDef.GetID() == ASSETCHAINS_CHAINID),
-                                                                updatedChecks ? CCoinbaseCurrencyState::PBAAS_1_0_8 :
-                                                                    CCoinbaseCurrencyState::PBAAS_1_0_0);
+                                                                updatedChecks ? (ConnectedChains.CheckClearConvert(nHeight) ? CCoinbaseCurrencyState::PBAAS_1_0_10 :
+                                                                                 CCoinbaseCurrencyState::PBAAS_1_0_8) :
+                                                                                CCoinbaseCurrencyState::PBAAS_1_0_0);
 
                             // between clear launch and complete, we need to adjust supply for verification
                             if (!checkState.IsFractional() &&
@@ -3136,7 +3137,7 @@ CReserveTransactionDescriptor::CReserveTransactionDescriptor(const CTransaction 
                                 startingOutput = eOutEnd + 1;
                             }
                             if (startingOutput < 0 ||
-                                checkOutputs.size() > cci.numOutputs ||
+                                checkOutputs.size() != cci.numOutputs ||
                                 (startingOutput + checkOutputs.size()) > tx.vout.size())
                             {
                                 LogPrint("importtransactions", "%s: import outputs would index beyond import transaction\n", __func__);
@@ -5443,6 +5444,7 @@ bool CReserveTransactionDescriptor::AddReserveTransferImportOutputs(const CCurre
     CAmount netPrimaryOut = 0;
     spentCurrencyOut.valueMap.clear();
     CCurrencyValueMap ReserveInputs;
+    newCurrencyState.primaryCurrencyOut = 0;
 
     // remove burned currency from supply
     //
@@ -5450,7 +5452,6 @@ bool CReserveTransactionDescriptor::AddReserveTransferImportOutputs(const CCurre
     if (liquidityFees.valueMap.count(importCurrencyID))
     {
         CAmount primaryLiquidityFees = liquidityFees.valueMap[importCurrencyID];
-        newCurrencyState.primaryCurrencyOut -= primaryLiquidityFees;
         liquidityFees.valueMap.erase(importCurrencyID);
 
         // properly burn fees
@@ -5695,6 +5696,10 @@ bool CReserveTransactionDescriptor::AddReserveTransferImportOutputs(const CCurre
             }
         }
         newCurrencyState.supply += (netPrimaryOut - netPrimaryIn);
+        if (ConnectedChains.CheckClearConvert(height))
+        {
+            newCurrencyState.primaryCurrencyOut -= netPrimaryIn;
+        }
         netPrimaryIn += totalNewFrac;
     }
     else
@@ -5920,7 +5925,7 @@ bool CReserveTransactionDescriptor::AddReserveTransferImportOutputs(const CCurre
         spentCurrencyOut.valueMap[importCurrencyID] += netPrimaryOut;
     }
 
-    newCurrencyState.primaryCurrencyOut = netPrimaryOut - (burnedChangePrice + burnedChangeWeight);
+    newCurrencyState.primaryCurrencyOut += (netPrimaryOut - (burnedChangePrice + burnedChangeWeight));
 
     if (importCurrencyDef.IsPBaaSChain() && importCurrencyState.IsLaunchConfirmed())
     {
@@ -6667,7 +6672,7 @@ void CCoinbaseCurrencyState::RevertReservesAndSupply(const uint160 &systemID, bo
                     reserves[oneCur.second] += (reserveOut[oneCur.second] - reserveIn[oneCur.second]);
                 }
 
-                if (IsLaunchCompleteMarker())
+                if (IsLaunchCompleteMarker() && reversionUpdate < ReversionUpdate::PBAAS_1_0_10)
                 {
                     supply += primaryCurrencyIn[oneCur.second];
                 }

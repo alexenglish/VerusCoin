@@ -4286,7 +4286,7 @@ UniValue fundrawtransaction(const UniValue& params, bool fHelp)
 
         if (params.size() < 3 ||
             (changeDest = DecodeDestination(uni_get_str(params[2]))).which() == COptCCParams::ADDRTYPE_INVALID ||
-            (changeDest.which() != COptCCParams::ADDRTYPE_INVALID &&
+            (changeDest.which() != COptCCParams::ADDRTYPE_ID &&
              changeDest.which() != COptCCParams::ADDRTYPE_PK &&
              changeDest.which() != COptCCParams::ADDRTYPE_PKH &&
              changeDest.which() != COptCCParams::ADDRTYPE_SH))
@@ -4297,7 +4297,16 @@ UniValue fundrawtransaction(const UniValue& params, bool fHelp)
         std::map<CUTXORef, CCurrencyValueMap> utxos;
         std::vector<std::pair<CUTXORef, CCurrencyValueMap>> utxoVec;
         LOCK(cs_main);
-        CCoinsViewCache view(pcoinsTip);
+        LOCK2(smartTransactionCS, mempool.cs);
+
+        CCoinsView dummy;
+        CCoinsViewCache view(&dummy);
+        int64_t interest;
+        CAmount nValueIn = 0;
+        CCoinsViewMemPool viewMemPool(pcoinsTip, mempool);
+
+        view.SetBackend(viewMemPool);
+
         for (int i = 0; i < params[1].size(); i++)
         {
             CUTXORef oneRef(params[1][i]);
@@ -4342,7 +4351,7 @@ UniValue fundrawtransaction(const UniValue& params, bool fHelp)
 
         if (params.size() > 3)
         {
-            nFee = uni_get_int64(params[3]);
+            nFee = AmountFromValue(params[3]);
         }
         if (nFee)
         {

@@ -515,7 +515,7 @@ std::string HelpMessage(HelpMessageMode mode)
     strUsage += HelpMessageOpt("-pubkey=<hexpubkey>", _("If set, mining and staking rewards will go to this address by default"));
     strUsage += HelpMessageOpt("-defaultid=<i-address>", _("VerusID used for default change out and staking reward recipient"));
     strUsage += HelpMessageOpt("-notaryid=<i-address>", _("VerusID used for PBaaS and Ethereum cross-chain notarization"));
-    strUsage += HelpMessageOpt("-notificationoracle=<i-address>", strprintf(_("VerusID monitored for network alerts, triggers, and signals. Current default is \"%s\" for Verus and the chain ID for PBaaS chains"), PBAAS_DEFAULT_NOTIFICATION_ORACLE.c_str()));
+    strUsage += HelpMessageOpt("-notificationoracle=<i-address>", _("VerusID monitored for network alerts, triggers, and signals. Current default is the chain ID for VRSC and all PBaaS chains"));
     strUsage += HelpMessageOpt("-acceptfreeimportsfrom=<i-address>,<i-address>,...", _(" \"%s\" no spaces - accept underpaid imports from these PBaaS chains or networks - default is empty"));
     strUsage += HelpMessageOpt("-approvecontractupgrade=<0xf09...>", strprintf(_("When validating blocks, vote to agree to upgrade to the specific contract. Default is no upgrade.")));
     strUsage += HelpMessageOpt("-defaultzaddr=<sapling-address>", _("sapling address to receive fraud proof rewards and if used with \"-privatechange=1\", z-change address for the sendcurrency command"));
@@ -1287,7 +1287,11 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
     }
 
     // get default IDs and addresses
-    auto chainUpgradeOracle = DecodeDestination(GetArg("-notificationoracle", IsVerusActive() ? PBAAS_DEFAULT_NOTIFICATION_ORACLE : EncodeDestination(CIdentityID(ASSETCHAINS_CHAINID))));
+    if (PBAAS_DEFAULT_NOTIFICATION_ORACLE.empty())
+    {
+        PBAAS_DEFAULT_NOTIFICATION_ORACLE = EncodeDestination(CIdentityID(ASSETCHAINS_CHAINID));
+    }
+    auto chainUpgradeOracle = DecodeDestination(GetArg("-notificationoracle", PBAAS_DEFAULT_NOTIFICATION_ORACLE));
     PBAAS_NOTIFICATION_ORACLE = chainUpgradeOracle.which() == COptCCParams::ADDRTYPE_ID ? CIdentityID(GetDestinationID(chainUpgradeOracle)) : CIdentityID();
     auto upgradeContractAddress = CTransferDestination::DecodeEthDestination(GetArg("-approvecontractupgrade", ""));
     if (!upgradeContractAddress.IsNull())

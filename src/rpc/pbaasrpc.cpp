@@ -5532,6 +5532,10 @@ UniValue estimateconversion(const UniValue& params, bool fHelp)
 
             "\nResult:\n"
             "   {\n"
+            "      \"inputcurrencyid\": iaddress                    i-address of source currency\n"
+            "      \"netinputamount\": value                        net amount in, after conversion fees in source currency\n"
+            "      \"outputcurrencyid\": iaddress                   i-address of destination currency\n"
+            "      \"estimatedcurrencyout\": value                  estimated amount out in destination currency\n"
             "      \"estimatedcurrencystate\": object               Estimation of all currency values, including prices and changes\n"
             "   }\n"
 
@@ -5700,8 +5704,7 @@ UniValue estimateconversion(const UniValue& params, bool fHelp)
                                    ConnectedChains.ThisChain().GetTransactionTransferFee(),
                                    convertToCurrencyID,
                                    DestinationToTransferDestination(CKeyID(convertToCurrencyID)),
-                                   secondCurrencyID,
-                                   ASSETCHAINS_CHAINID);
+                                   secondCurrencyID);
 
     // now, get last notarization and all pending conversion transactions, calculate new conversions, including the new one to estimate and
     // return results
@@ -5737,12 +5740,41 @@ UniValue estimateconversion(const UniValue& params, bool fHelp)
     }
 
     UniValue retVal(UniValue::VOBJ);
-    retVal.pushKV("estimatedcurrencystate", ConnectedChains.AddPendingConversions(*pFractionalCurrency,
-                                            notarization,
-                                            notarization.notarizationHeight,
-                                            nHeight,
-                                            0,
-                                            std::vector<CReserveTransfer>({checkTransfer})).ToUniValue());
+    CCoinbaseCurrencyState currencyState = ConnectedChains.AddPendingConversions(*pFractionalCurrency,
+                                                                                 notarization,
+                                                                                 notarization.notarizationHeight,
+                                                                                 nHeight,
+                                                                                 0,
+                                                                                 std::vector<CReserveTransfer>({checkTransfer}));
+    if (!currencyState.IsValid())
+    {
+        throw JSONRPCError(RPC_TRANSACTION_ERROR, "Cannot process conversion parameters for " + pFractionalCurrency->name);
+    }
+
+    CAmount startingAmount = sourceAmount - CReserveTransactionDescriptor::CalculateConversionFeeNoMin(sourceAmount);
+    if (secondCurrencyID == pFractionalCurrency->GetID())
+    {
+        startingAmount = startingAmount - CReserveTransactionDescriptor::CalculateConversionFeeNoMin(sourceAmount);
+    }
+    CAmount amountOut = 0;
+    if (checkTransfer.IsImportToSource())
+    {
+        amountOut = currencyState.NativeToReserveRaw(startingAmount, currencyState.conversionPrice[currencyState.GetReserveMap()[convertToCurrencyID]]);
+    }
+    else
+    {
+        amountOut = currencyState.ReserveToNativeRaw(startingAmount, currencyState.conversionPrice[currencyState.GetReserveMap()[sourceCurrencyID]]);
+        if (reserveToReserve)
+        {
+            amountOut = currencyState.NativeToReserveRaw(amountOut, currencyState.viaConversionPrice[currencyState.GetReserveMap()[secondCurrencyID]]);
+        }
+    }
+
+    retVal.pushKV("inputcurrencyid", EncodeDestination(CIdentityID(sourceCurrencyID)));
+    retVal.pushKV("netinputamount", ValueFromAmount(startingAmount));
+    retVal.pushKV("outputcurrencyid", EncodeDestination(CIdentityID(reserveToReserve ? secondCurrencyID : convertToCurrencyID)));
+    retVal.pushKV("estimatedcurrencyout", ValueFromAmount(amountOut));
+    retVal.pushKV("estimatedcurrencystate", currencyState.ToUniValue());
     return retVal;
 }
 

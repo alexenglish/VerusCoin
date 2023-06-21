@@ -982,7 +982,7 @@ bool AddOneCurrencyImport(const CCurrencyDefinition &newCurrency,
             bool updatedMinMax = newCurrency.IsPBaaSChain() &&
                                  lastNotarization.proofRoots.count(VERUS_CHAINID) &&
                                  lastNotarization.proofRoots.find(VERUS_CHAINID)->second.rootHeight >= ConnectedChains.GetZeroViaHeight(PBAAS_TESTMODE);
- 
+
             if (updatedMinMax)
             {
                 tempLastNotarization.currencyState.primaryCurrencyIn = std::vector<int64_t>(tempLastNotarization.currencyState.primaryCurrencyIn.size(), 0);
@@ -3234,7 +3234,7 @@ CBlockTemplate* CreateNewBlock(const CChainParams& chainparams, const std::vecto
                     if (!mempool.mapTx.count(txin.prevout.hash))
                     {
                         LogPrintf("ERROR: mempool transaction missing input\n");
-                        if (fDebug) assert("mempool transaction missing input" == 0);
+                        LogPrint("mempool", "mempool transaction missing input");
                         fMissingInputs = true;
                         if (porphan)
                             vOrphan.pop_back();

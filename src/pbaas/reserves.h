@@ -45,7 +45,9 @@ extern uint32_t PBAAS_TESTFORK2_TIME;
 extern uint32_t PBAAS_ENFORCE_CORRECT_EVIDENCE_TIME;
 extern uint32_t PBAAS_TESTFORK3_TIME;
 extern uint32_t PBAAS_TESTFORK4_TIME;
+extern uint32_t PBAAS_TESTFORK5_TIME;
 extern uint32_t PBAAS_MAINDEFI3_HEIGHT;
+extern uint32_t PBAAS_CLEARCONVERT_HEIGHT;
 
 // reserve output is a special kind of token output that does not have to carry it's identifier, as it
 // is always assumed to be the reserve currency of the current chain.
@@ -1498,7 +1500,8 @@ public:
 
     enum ReversionUpdate {
         PBAAS_1_0_0 = 0,
-        PBAAS_1_0_8 = 1
+        PBAAS_1_0_8 = 1,
+        PBAAS_1_0_10 = 2
     };
 
     CCoinbaseCurrencyState() : primaryCurrencyOut(0), preConvertedOut(0), primaryCurrencyFees(0), primaryCurrencyConversionFees(0) {}

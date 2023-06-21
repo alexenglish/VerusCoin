@@ -834,7 +834,7 @@ CCurrencyValueMap CScript::ReserveOutValue(COptCCParams &p, bool spendableOnly) 
                 CCrossChainImport cci(p.vData[0]);
                 // reserve out amount when converting to reserve is 0, since the amount cannot be calculated in isolation as an input
                 // if reserve in, we can consider the output the same reserve value as the input
-                retVal = cci.totalReserveOutMap;
+                //retVal = cci.totalReserveOutMap;
                 break;
             }
 
