@@ -1315,9 +1315,11 @@ bool ValidateSpendingIdentityReservation(const CTransaction &tx, int32_t outNum,
             {
                 if (isPBaaS)
                 {
+                    bool testModePreUpdate = PBAAS_TESTMODE && !ConnectedChains.IncludePostLaunchFees(height);
                     if (issuingCurrency.proofProtocol == issuingCurrency.PROOF_CHAINID &&
                         (issuingCurrency.endBlock == 0 ||
-                         issuingCurrency.endBlock <= height))
+                         ((testModePreUpdate && issuingCurrency.endBlock <= height) ||
+                          (!testModePreUpdate && height <= issuingCurrency.endBlock))))
                     {
                         // if this is a purchase from centralized/DAO-based currency, ensure we have a valid output
                         // of the correct amount to the issuer ID before any of the referrals
@@ -1980,9 +1982,11 @@ bool PrecheckIdentityReservation(const CTransaction &tx, int32_t outNum, CValida
             {
                 if (isPBaaS)
                 {
+                    bool testModePreUpdate = PBAAS_TESTMODE && !ConnectedChains.IncludePostLaunchFees(height);
                     if (issuingCurrency.proofProtocol == issuingCurrency.PROOF_CHAINID &&
                         (issuingCurrency.endBlock == 0 ||
-                         issuingCurrency.endBlock <= height))
+                         ((testModePreUpdate && issuingCurrency.endBlock <= height) ||
+                          (!testModePreUpdate && height <= issuingCurrency.endBlock))))
                     {
                         // if this is a purchase from centralized/DAO-based currency, ensure we have a valid output
                         // of the correct amount to the issuer ID before any of the referrals
@@ -2825,8 +2829,15 @@ bool PrecheckIdentityPrimary(const CTransaction &tx, int32_t outNum, CValidation
                 }
                 if (i == outNum)
                 {
-                    return ConnectedChains.FirstNotaryChain().IsValid() &&
-                           IsValidBlockOneCoinbase(tx.vout, ConnectedChains.FirstNotaryChain(), ConnectedChains.ThisChain(), state);
+                    if (ConnectedChains.FirstNotaryChain().IsValid() &&
+                        IsValidBlockOneCoinbase(tx.vout, ConnectedChains.FirstNotaryChain(), ConnectedChains.ThisChain(), state))
+                    {
+                        return true;
+                    }
+                    else
+                    {
+                        return state.Error("Invalid block 1 coinbase");
+                    }
                 }
                 else
                 {

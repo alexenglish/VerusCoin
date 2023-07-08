@@ -5923,7 +5923,7 @@ bool CWallet::SelectReserveUTXOs(const CCurrencyValueMap& targetValues,
         if (nTotal == nTotalTarget)
         {
             mapCoinsRet.insert(output);
-            valueRet = output.second;
+            valueRet = nAll;
             nativeValueRet = nativeN;
             return true;
         }

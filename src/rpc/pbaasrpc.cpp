@@ -3517,8 +3517,11 @@ bool GetNotarizationData(const uint160 &currencyID,
         std::tuple<uint32_t, CUTXORef, CPBaaSNotarization> lastFinalized = GetLastConfirmedNotarization(currencyID, chainActive.Height());
         if (std::get<0>(lastFinalized) == 0)
         {
-            LogPrintf("No confirmed notarization for %s, node may need to reindex\n", EncodeDestination(CIdentityID(currencyID)).c_str());
-            printf("No confirmed notarization for %s, node may need to reindex\n", EncodeDestination(CIdentityID(currencyID)).c_str());
+            if (LogAcceptCategory("defi"))
+            {
+                LogPrintf("No confirmed notarization for %s\n", EncodeDestination(CIdentityID(currencyID)).c_str());
+                printf("No confirmed notarization for %s\n", EncodeDestination(CIdentityID(currencyID)).c_str());
+            }
             return false;
         }
         if (chainDef.SystemOrGatewayID() == ASSETCHAINS_CHAINID)
@@ -5208,6 +5211,11 @@ bool FundTransparentTransactionBuilder(CWallet *pwallet, TransactionBuilder &tb,
                                             reservesUsed,
                                             nativeUsed))
     {
+        CTxDestination _dest;
+        if (!pFromDest)
+        {
+            pFromDest = &_dest;
+        }
         LogPrintf("%s: ERROR FUNDING TRANSACTION: Insufficient funds held by %s\n", __func__, EncodeDestination(*pFromDest).c_str());
         return false;
     }
@@ -5244,6 +5252,11 @@ UniValue submitacceptednotarization(const UniValue& params, bool fHelp)
     }
 
     CheckPBaaSAPIsValid();
+
+    if (VERUS_NOTARYID.IsNull())
+    {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Set \"-notaryid=idname@\" on startup to submit and earn from notarization transactions");
+    }
 
     uint32_t nHeight = chainActive.Height();
 
@@ -5301,7 +5314,7 @@ UniValue submitacceptednotarization(const UniValue& params, bool fHelp)
         }
         CTxDestination fromDest(VERUS_NOTARYID);
         if (fromDest.which() == COptCCParams::ADDRTYPE_INVALID ||
-            !FundTransparentTransactionBuilder(pwalletMain, tb, VERUS_NOTARYID.IsNull() ? nullptr : &fromDest))
+            !FundTransparentTransactionBuilder(pwalletMain, tb, &fromDest))
         {
             throw JSONRPCError(RPC_INVALID_PARAMETER, "Unable to fund notarization transaction");
         }
@@ -8573,6 +8586,7 @@ UniValue sendcurrency(const UniValue& params, bool fHelp)
             "      \"currency\": \"name\"   (string, required) Name of the source currency to send in this output, defaults to native of chain\n"
             "      \"amount\":amount        (numeric, required) The numeric amount of currency, denominated in source currency\n"
             "      \"convertto\":\"name\",  (string, optional) Valid currency to convert to, either a reserve of a fractional, or fractional\n"
+            "      \"addconversionfees\":\"false\", (bool, optional) Calculate additional conversion fees to convert the full amount specified after fees\n"
             "      \"exportto\":\"name\",   (string, optional) Valid chain or system name or ID to export to\n"
             "      \"exportid\":\"false\",  (bool, optional) if cross-chain export, export the full ID to the destination chain (will cost to export)\n"
             "      \"exportcurrency\":\"false\", (bool, optional) if cross-chain export, export the currency definition (will cost to export)\n"
@@ -8679,7 +8693,7 @@ UniValue sendcurrency(const UniValue& params, bool fHelp)
 
     bool hasOpRet = false;
 
-    static std::set<std::string> paramSet({"currency", "amount", "convertto", "exportto", "feecurrency", "via", "address", "exportid", "exportcurrency", "refundto", "memo", "preconvert",  "burn", "burnweight", "mintnew", "opret"});
+    static std::set<std::string> paramSet({"currency", "amount", "convertto", "exportto", "feecurrency", "via", "address", "exportid", "exportcurrency", "refundto", "memo", "preconvert",  "burn", "burnweight", "mintnew", "addconversionfees", "opret"});
 
     //printf("%s: params[1]: %s\n", __func__, params[1].write(1,2).c_str());
 
@@ -8707,6 +8721,7 @@ UniValue sendcurrency(const UniValue& params, bool fHelp)
             bool burnCurrency = uni_get_bool(find_value(uniOutputs[i], "burn")) || uni_get_bool(find_value(uniOutputs[i], "burnweight"));
             bool burnWeight = uni_get_bool(find_value(uniOutputs[i], "burnweight"));
             bool mintNew = uni_get_bool(find_value(uniOutputs[i], "mintnew"));
+            bool addConversionFees = uni_get_bool(find_value(uniOutputs[i], "addconversionfees"));
 
             auto rawCurrencyStr = uni_get_str(find_value(uniOutputs[i], "currency"));
             auto currencyStr = TrimSpaces(rawCurrencyStr, true);
@@ -8934,6 +8949,17 @@ UniValue sendcurrency(const UniValue& params, bool fHelp)
             fromFractional = isConversion &&
                              !toFractional &&
                              sourceCurrencyDef.IsFractional() && !convertToCurrencyID.IsNull() && sourceCurrencyDef.GetCurrenciesMap().count(convertToCurrencyID);
+
+            if (addConversionFees && isConversion)
+            {
+                CAmount additionalFee = CReserveTransactionDescriptor::CalculateAdditionalConversionFeeNoMin(sourceAmount);
+                if (isVia)
+                {
+                    additionalFee <<= 1;
+                }
+                sourceAmount += additionalFee;
+            }
+
             if (toFractional || preConvert)
             {
                 destSystemID = convertToCurrencyDef.systemID;
@@ -10624,8 +10650,9 @@ CCurrencyDefinition ValidateNewUnivalueCurrencyDefinition(const UniValue &uniObj
             throw JSONRPCError(RPC_INVALID_PARAMETER, "currency cannot be both a token and also specify a mining and staking rewards schedule.");
         }
 
-        if ((newCurrency.nativeCurrencyID.TypeNoFlags() == newCurrency.nativeCurrencyID.DEST_ETH && !newCurrency.IsGateway()) ||
-            newCurrency.nativeCurrencyID.TypeNoFlags() == newCurrency.nativeCurrencyID.DEST_ETHNFT)
+        if (!newCurrency.IsGateway() && 
+            (newCurrency.nativeCurrencyID.TypeNoFlags() == newCurrency.nativeCurrencyID.DEST_ETH ||
+             newCurrency.nativeCurrencyID.TypeNoFlags() == newCurrency.nativeCurrencyID.DEST_ETHNFT))
         {
             if (newCurrency.IsPBaaSChain() ||
                 !newCurrency.IsToken() ||
@@ -10652,7 +10679,7 @@ CCurrencyDefinition ValidateNewUnivalueCurrencyDefinition(const UniValue &uniObj
             CCurrencyDefinition systemCurrency = ConnectedChains.GetCachedCurrency(newCurrency.systemID);
             if (systemCurrency.IsValid() &&
                 (!systemCurrency.IsGateway() ||
-                 systemCurrency.launchSystemID != ASSETCHAINS_CHAINID ||
+                 (systemCurrency.launchSystemID != ASSETCHAINS_CHAINID && newCurrency.parent != ASSETCHAINS_CHAINID) ||
                  systemCurrency.proofProtocol != systemCurrency.PROOF_ETHNOTARIZATION))
             {
                 throw JSONRPCError(RPC_INVALID_PARAMETER, "Ethereum protocol networks are the only mapped currency type currently supported");
@@ -11383,294 +11410,301 @@ UniValue definecurrency(const UniValue& params, bool fHelp)
     uint32_t lastImportHeight = newChain.IsPBaaSChain() || newChain.IsGateway() ? 1 : height;
 
     // if it's a mapped currency, we don't need to add anything but the definition with no launch period
-    bool isMappedCurrency = newChain.IsToken() && !newChain.IsGateway() && !newChain.IsPBaaSChain() && !newChain.IsGatewayConverter() &&
-                           newChain.nativeCurrencyID.IsValid() && parentCurrency.IsGateway() && newChain.systemID != ASSETCHAINS_CHAINID;
-
-    // create import and export outputs
-    cp = CCinit(&CC, EVAL_CROSSCHAIN_IMPORT);
-    pk = CPubKey(ParseHex(CC.CChexstr));
-
-    if (newChain.proofProtocol == newChain.PROOF_PBAASMMR ||
-        newChain.proofProtocol == newChain.PROOF_ETHNOTARIZATION ||
-        newChain.proofProtocol == newChain.PROOF_CHAINID)
-    {
-        dests = std::vector<CTxDestination>({pk.GetID()});
-    }
-    else
-    {
-        throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid notarization protocol specified");
-    }
-
-    CCrossChainImport cci = CCrossChainImport(newChain.SystemOrGatewayID(),
-                                              lastImportHeight,
-                                              newChainID,
-                                              CCurrencyValueMap(),
-                                              CCurrencyValueMap());
-    cci.SetSameChain(newChain.systemID == ASSETCHAINS_CHAINID);
-    cci.SetDefinitionImport(true);
-    if (newChainID == ASSETCHAINS_CHAINID || newChain.IsGateway())
-    {
-        cci.SetPostLaunch();
-        cci.SetInitialLaunchImport();
-    }
-    cci.exportTxOutNum = tb.mtx.vout.size() + 2;
-    tb.AddTransparentOutput(MakeMofNCCScript(CConditionObj<CCrossChainImport>(EVAL_CROSSCHAIN_IMPORT, dests, 1, &cci)), 0);
-
-    // get initial currency state at this height
-    newCurrencyState = ConnectedChains.GetCurrencyState(newChain, height + 1);
-
-    newCurrencyState.SetPrelaunch();
-
-    CPBaaSNotarization pbn = CPBaaSNotarization(newChainID,
-                                                newCurrencyState,
-                                                height,
-                                                CUTXORef(),
-                                                0);
-
-    pbn.SetSameChain();
-    pbn.SetDefinitionNotarization();
-    pbn.nodes = startupNodes;
-
-    if (newCurrencyState.GetID() == ASSETCHAINS_CHAINID || newChain.IsGateway() || isMappedCurrency)
-    {
-        newChain.startBlock = 1;
-        newCurrencyState.SetPrelaunch(false);
-        newCurrencyState.SetLaunchConfirmed();
-        newCurrencyState.SetLaunchCompleteMarker();
-        pbn.currencyState = newCurrencyState;
-        pbn.SetPreLaunch(false);
-        pbn.SetLaunchCleared();
-        pbn.SetLaunchConfirmed();
-        pbn.SetLaunchComplete();
-    }
-    else
-    {
-        pbn.SetPreLaunch();
-    }
-
-    // make the first chain notarization output
-    cp = CCinit(&CC, EVAL_ACCEPTEDNOTARIZATION);
-    CTxDestination notarizationDest;
-
-    if (newChain.notarizationProtocol == newChain.NOTARIZATION_AUTO ||
-        newChain.notarizationProtocol == newChain.NOTARIZATION_NOTARY_CONFIRM ||
-        newChain.notarizationProtocol == newChain.NOTARIZATION_NOTARY_CHAINID)
-    {
-        notarizationDest = CPubKey(ParseHex(CC.CChexstr));
-    }
-    else
-    {
-        throw JSONRPCError(RPC_INVALID_PARAMETER, "No valid notarization protocol specified");
-    }
-
-    dests = std::vector<CTxDestination>({notarizationDest});
-
-    tb.AddTransparentOutput(MakeMofNCCScript(CConditionObj<CPBaaSNotarization>(EVAL_ACCEPTEDNOTARIZATION, dests, 1, &pbn)),
-                                        CPBaaSNotarization::MIN_NOTARIZATION_OUTPUT);
-
-    // export thread
-    cp = CCinit(&CC, EVAL_CROSSCHAIN_EXPORT);
-    dests = std::vector<CTxDestination>({CPubKey(ParseHex(CC.CChexstr))});
-
-    CCrossChainExport ccx = CCrossChainExport(thisChainID,
-                                            0,
-                                            height,
-                                            (newChain.IsPBaaSChain() || newChain.IsGateway() || newChain.IsGatewayConverter()) ?
-                                                newChain.SystemOrGatewayID() :
-                                                ASSETCHAINS_CHAINID,
-                                            newChainID,
-                                            0,
-                                            mainImportFees,
-                                            mainImportFees,
-                                            uint256());
-    ccx.SetChainDefinition();
-    if (newCurrencyState.GetID() == ASSETCHAINS_CHAINID || newChain.IsGateway() || isMappedCurrency)
-    {
-        ccx.SetPreLaunch(false);
-        ccx.SetPostLaunch();
-    }
-    else
-    {
-        ccx.SetPreLaunch();
-    }
-    tb.AddTransparentOutput(MakeMofNCCScript(CConditionObj<CCrossChainExport>(EVAL_CROSSCHAIN_EXPORT, dests, 1, &ccx)), 0);
-
-    // make the outputs for initial contributions
-    if (newChain.contributions.size() && newChain.contributions.size() == newChain.currencies.size())
-    {
-        for (int i = 0; i < newChain.currencies.size(); i++)
-        {
-            if (newChain.contributions[i] > 0)
-            {
-                CAmount contribution = newChain.contributions[i] +
-                                        CReserveTransactionDescriptor::CalculateAdditionalConversionFee(newChain.contributions[i]);
-                CAmount fee = CReserveTransfer::DEFAULT_PER_STEP_FEE << 1;
-
-                CReserveTransfer rt = CReserveTransfer(CReserveTransfer::VALID + CReserveTransfer::PRECONVERT,
-                                                    newChain.currencies[i],
-                                                    contribution,
-                                                    ASSETCHAINS_CHAINID,
-                                                    fee,
-                                                    newChainID,
-                                                    DestinationToTransferDestination(CIdentityID(newChainID)));
-
-                cp = CCinit(&CC, EVAL_RESERVE_TRANSFER);
-                CPubKey pk(ParseHex(CC.CChexstr));
-
-                dests = std::vector<CTxDestination>({pk.GetID()});
-
-                tb.AddTransparentOutput(MakeMofNCCScript(CConditionObj<CReserveTransfer>(EVAL_RESERVE_TRANSFER, dests, 1, &rt)),
-                                                    newChain.currencies[i] == thisChainID ? contribution + fee : fee);
-            }
-        }
-    }
+    bool isMappedCurrency = newChain.IsToken() &&
+                            !newChain.IsGateway() && !newChain.IsPBaaSChain() &&
+                            !newChain.IsGatewayConverter() &&
+                            newChain.nativeCurrencyID.IsValid() &&
+                            (parentCurrency.IsGateway() || parentCurrency.GetID() == ASSETCHAINS_CHAINID) &&
+                            newChain.systemID != ASSETCHAINS_CHAINID;
 
     CAmount totalLaunchFee = ConnectedChains.ThisChain().GetCurrencyRegistrationFee(newChain.options);
     CAmount notaryFeeShare = 0;
 
-    // now, setup the gateway converter currency, if appropriate
-    if ((newChain.IsPBaaSChain() || newChain.IsGateway()))
+    if (!isMappedCurrency)
     {
-        if (newGatewayConverter.IsValid())
+        // create import and export outputs
+        cp = CCinit(&CC, EVAL_CROSSCHAIN_IMPORT);
+        pk = CPubKey(ParseHex(CC.CChexstr));
+
+        if (newChain.proofProtocol == newChain.PROOF_PBAASMMR ||
+            newChain.proofProtocol == newChain.PROOF_ETHNOTARIZATION ||
+            newChain.proofProtocol == newChain.PROOF_CHAINID)
         {
-            cp = CCinit(&CC, EVAL_CURRENCY_DEFINITION);
+            dests = std::vector<CTxDestination>({pk.GetID()});
+        }
+        else
+        {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid notarization protocol specified");
+        }
 
-            // create any new reserve currencies needed that are mapped to the gateway
-            // for now, there is only an import fee for these currencies, since they do not launch
-            for (auto oneNewReserve : newReserveCurrencies)
-            {
-                // define one currency
-                // and add one import currency fee for each new reserve
-                newReserveImportFees += ConnectedChains.ThisChain().currencyImportFee;
-                std::vector<CTxDestination> dests({CPubKey(ParseHex(CC.CChexstr))});
-                tb.AddTransparentOutput(MakeMofNCCScript(CConditionObj<CCurrencyDefinition>(EVAL_CURRENCY_DEFINITION, dests, 1, &oneNewReserve.second)),
-                                                    CCurrencyDefinition::DEFAULT_OUTPUT_VALUE);
-            }
+        CCrossChainImport cci = CCrossChainImport(newChain.SystemOrGatewayID(),
+                                                lastImportHeight,
+                                                newChainID,
+                                                CCurrencyValueMap(),
+                                                CCurrencyValueMap());
+        cci.SetSameChain(newChain.systemID == ASSETCHAINS_CHAINID);
+        cci.SetDefinitionImport(true);
+        if (newChainID == ASSETCHAINS_CHAINID || newChain.IsGateway())
+        {
+            cci.SetPostLaunch();
+            cci.SetInitialLaunchImport();
+        }
+        cci.exportTxOutNum = tb.mtx.vout.size() + 2;
+        tb.AddTransparentOutput(MakeMofNCCScript(CConditionObj<CCrossChainImport>(EVAL_CROSSCHAIN_IMPORT, dests, 1, &cci)), 0);
 
-            if (newChain.IsGateway() &&
-                newChain.notaries.size() &&
-                (newChain.notarizationProtocol == newChain.NOTARIZATION_AUTO ||
-                 newChain.notarizationProtocol == newChain.NOTARIZATION_NOTARY_CONFIRM))
+        // get initial currency state at this height
+        newCurrencyState = ConnectedChains.GetCurrencyState(newChain, height + 1);
+
+        newCurrencyState.SetPrelaunch();
+
+        CPBaaSNotarization pbn = CPBaaSNotarization(newChainID,
+                                                    newCurrencyState,
+                                                    height,
+                                                    CUTXORef(),
+                                                    0);
+
+        pbn.SetSameChain();
+        pbn.SetDefinitionNotarization();
+        pbn.nodes = startupNodes;
+
+        if (newCurrencyState.GetID() == ASSETCHAINS_CHAINID || newChain.IsGateway() || isMappedCurrency)
+        {
+            newChain.startBlock = 1;
+            newCurrencyState.SetPrelaunch(false);
+            newCurrencyState.SetLaunchConfirmed();
+            newCurrencyState.SetLaunchCompleteMarker();
+            pbn.currencyState = newCurrencyState;
+            pbn.SetPreLaunch(false);
+            pbn.SetLaunchCleared();
+            pbn.SetLaunchConfirmed();
+            pbn.SetLaunchComplete();
+        }
+        else
+        {
+            pbn.SetPreLaunch();
+        }
+
+        // make the first chain notarization output
+        cp = CCinit(&CC, EVAL_ACCEPTEDNOTARIZATION);
+        CTxDestination notarizationDest;
+
+        if (newChain.notarizationProtocol == newChain.NOTARIZATION_AUTO ||
+            newChain.notarizationProtocol == newChain.NOTARIZATION_NOTARY_CONFIRM ||
+            newChain.notarizationProtocol == newChain.NOTARIZATION_NOTARY_CHAINID)
+        {
+            notarizationDest = CPubKey(ParseHex(CC.CChexstr));
+        }
+        else
+        {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "No valid notarization protocol specified");
+        }
+
+        dests = std::vector<CTxDestination>({notarizationDest});
+
+        tb.AddTransparentOutput(MakeMofNCCScript(CConditionObj<CPBaaSNotarization>(EVAL_ACCEPTEDNOTARIZATION, dests, 1, &pbn)),
+                                            CPBaaSNotarization::MIN_NOTARIZATION_OUTPUT);
+
+        // export thread
+        cp = CCinit(&CC, EVAL_CROSSCHAIN_EXPORT);
+        dests = std::vector<CTxDestination>({CPubKey(ParseHex(CC.CChexstr))});
+
+        CCrossChainExport ccx = CCrossChainExport(thisChainID,
+                                                0,
+                                                height,
+                                                (newChain.IsPBaaSChain() || newChain.IsGateway() || newChain.IsGatewayConverter()) ?
+                                                    newChain.SystemOrGatewayID() :
+                                                    ASSETCHAINS_CHAINID,
+                                                newChainID,
+                                                0,
+                                                mainImportFees,
+                                                mainImportFees,
+                                                uint256());
+        ccx.SetChainDefinition();
+        if (newCurrencyState.GetID() == ASSETCHAINS_CHAINID || newChain.IsGateway() || isMappedCurrency)
+        {
+            ccx.SetPreLaunch(false);
+            ccx.SetPostLaunch();
+        }
+        else
+        {
+            ccx.SetPreLaunch();
+        }
+        tb.AddTransparentOutput(MakeMofNCCScript(CConditionObj<CCrossChainExport>(EVAL_CROSSCHAIN_EXPORT, dests, 1, &ccx)), 0);
+
+        // make the outputs for initial contributions
+        if (newChain.contributions.size() && newChain.contributions.size() == newChain.currencies.size())
+        {
+            for (int i = 0; i < newChain.currencies.size(); i++)
             {
-                // notaries all get an even share of 10% of a currency launch fee to use for notarizing
-                notaryFeeShare = ConnectedChains.ThisChain().GetCurrencyRegistrationFee(newChain.options) / 100;
-                totalLaunchFee -= notaryFeeShare;
-                CAmount oneNotaryShare = notaryFeeShare / newChain.notaries.size();
-                CAmount notaryModExtra = notaryFeeShare % newChain.notaries.size();
-                for (auto &oneNotary : newChain.notaries)
+                if (newChain.contributions[i] > 0)
                 {
-                    tb.AddTransparentOutput(CIdentityID(oneNotary), notaryModExtra ? notaryModExtra--, oneNotaryShare + 1 : oneNotaryShare);
+                    CAmount contribution = newChain.contributions[i] +
+                                            CReserveTransactionDescriptor::CalculateAdditionalConversionFee(newChain.contributions[i]);
+                    CAmount fee = CReserveTransfer::DEFAULT_PER_STEP_FEE << 1;
+
+                    CReserveTransfer rt = CReserveTransfer(CReserveTransfer::VALID + CReserveTransfer::PRECONVERT,
+                                                        newChain.currencies[i],
+                                                        contribution,
+                                                        ASSETCHAINS_CHAINID,
+                                                        fee,
+                                                        newChainID,
+                                                        DestinationToTransferDestination(CIdentityID(newChainID)));
+
+                    cp = CCinit(&CC, EVAL_RESERVE_TRANSFER);
+                    CPubKey pk(ParseHex(CC.CChexstr));
+
+                    dests = std::vector<CTxDestination>({pk.GetID()});
+
+                    tb.AddTransparentOutput(MakeMofNCCScript(CConditionObj<CReserveTransfer>(EVAL_RESERVE_TRANSFER, dests, 1, &rt)),
+                                                        newChain.currencies[i] == thisChainID ? contribution + fee : fee);
                 }
             }
+        }
 
-            newGatewayConverter.gatewayConverterIssuance = newChain.gatewayConverterIssuance;
-
-            cp = CCinit(&CC, EVAL_CURRENCY_DEFINITION);
-            std::vector<CTxDestination> dests({CPubKey(ParseHex(CC.CChexstr))});
-            tb.AddTransparentOutput(MakeMofNCCScript(CConditionObj<CCurrencyDefinition>(EVAL_CURRENCY_DEFINITION, dests, 1, &newGatewayConverter)),
-                                                CCurrencyDefinition::DEFAULT_OUTPUT_VALUE);
-
-            // get initial currency state at this height
-            CCoinbaseCurrencyState gatewayCurrencyState = ConnectedChains.GetCurrencyState(newGatewayConverter, chainActive.Height() + 1);
-            int currencyIndex = gatewayCurrencyState.GetReserveMap()[newChainID];
-
-            gatewayCurrencyState.reserveIn[currencyIndex] += newChain.gatewayConverterIssuance;
-
-            uint160 gatewayCurrencyID = newGatewayConverter.GetID();
-
-            CPBaaSNotarization gatewayPbn = CPBaaSNotarization(gatewayCurrencyID,
-                                                            gatewayCurrencyState,
-                                                            height,
-                                                            CUTXORef(),
-                                                            0);
-
-            // launch notarizations are on this chain
-            gatewayPbn.SetSameChain();
-            gatewayPbn.SetPreLaunch();
-            gatewayPbn.SetDefinitionNotarization();
-
-            // create import and export outputs
-            cp = CCinit(&CC, EVAL_CROSSCHAIN_IMPORT);
-            pk = CPubKey(ParseHex(CC.CChexstr));
-
-            if (newGatewayConverter.proofProtocol == newGatewayConverter.PROOF_PBAASMMR ||
-                newGatewayConverter.proofProtocol == newGatewayConverter.PROOF_CHAINID ||
-                newGatewayConverter.proofProtocol == newGatewayConverter.PROOF_ETHNOTARIZATION)
+        // now, setup the gateway converter currency, if appropriate
+        if ((newChain.IsPBaaSChain() || newChain.IsGateway()))
+        {
+            if (newGatewayConverter.IsValid())
             {
-                dests = std::vector<CTxDestination>({pk.GetID()});
-            }
-            else
-            {
-                throw JSONRPCError(RPC_INVALID_PARAMETER, "None or invalid notarization protocol specified");
-            }
+                cp = CCinit(&CC, EVAL_CURRENCY_DEFINITION);
 
-            // if this is a token on this chain, the transfer that is output here is burned through the export
-            // and merges with the import thread. we multiply new input times 2, to cover both the import thread output
-            // and the reserve transfer outputs.
-            CCrossChainImport gatewayCci = CCrossChainImport(newGatewayConverter.systemID, lastImportHeight, gatewayCurrencyID, CCurrencyValueMap(), CCurrencyValueMap());
-            gatewayCci.SetSameChain(newGatewayConverter.systemID == ASSETCHAINS_CHAINID);
-            gatewayCci.SetDefinitionImport(true);
-
-            tb.AddTransparentOutput(MakeMofNCCScript(CConditionObj<CCrossChainImport>(EVAL_CROSSCHAIN_IMPORT, dests, 1, &gatewayCci)), 0);
-
-            // make the first chain notarization output
-            cp = CCinit(&CC, EVAL_ACCEPTEDNOTARIZATION);
-            CTxDestination notarizationDest;
-
-            if (newGatewayConverter.notarizationProtocol == newGatewayConverter.NOTARIZATION_AUTO ||
-                newGatewayConverter.notarizationProtocol == newGatewayConverter.NOTARIZATION_NOTARY_CONFIRM ||
-                newGatewayConverter.notarizationProtocol == newGatewayConverter.NOTARIZATION_NOTARY_CHAINID)
-            {
-                notarizationDest = CPubKey(ParseHex(CC.CChexstr));
-            }
-            else
-            {
-                throw JSONRPCError(RPC_INVALID_PARAMETER, "None or notarization protocol specified");
-            }
-
-            dests = std::vector<CTxDestination>({notarizationDest});
-
-            tb.AddTransparentOutput(MakeMofNCCScript(CConditionObj<CPBaaSNotarization>(EVAL_ACCEPTEDNOTARIZATION, dests, 1, &gatewayPbn)),
-                                                CPBaaSNotarization::MIN_NOTARIZATION_OUTPUT);
-
-            converterImportFee = ConnectedChains.ThisChain().LaunchFeeImportShare(newGatewayConverter.options);
-            converterImportFees.valueMap[thisChainID] += converterImportFee;
-
-            // export thread
-            cp = CCinit(&CC, EVAL_CROSSCHAIN_EXPORT);
-            dests = std::vector<CTxDestination>({CPubKey(ParseHex(CC.CChexstr))});
-            CCrossChainExport gatewayCcx = CCrossChainExport(thisChainID, 0, height, newGatewayConverter.systemID, gatewayCurrencyID, 0, converterImportFees, converterImportFees, uint256());
-            gatewayCcx.SetPreLaunch();
-            gatewayCcx.SetChainDefinition();
-
-            tb.AddTransparentOutput(MakeMofNCCScript(CConditionObj<CCrossChainExport>(EVAL_CROSSCHAIN_EXPORT, dests, 1, &gatewayCcx)), 0);
-
-            // make the outputs for initial contributions
-            if (newGatewayConverter.contributions.size() && newGatewayConverter.contributions.size() == newGatewayConverter.currencies.size())
-            {
-                for (int i = 0; i < newGatewayConverter.currencies.size(); i++)
+                // create any new reserve currencies needed that are mapped to the gateway
+                // for now, there is only an import fee for these currencies, since they do not launch
+                for (auto oneNewReserve : newReserveCurrencies)
                 {
-                    if (newGatewayConverter.contributions[i] > 0)
+                    // define one currency
+                    // and add one import currency fee for each new reserve
+                    newReserveImportFees += ConnectedChains.ThisChain().currencyImportFee;
+                    std::vector<CTxDestination> dests({CPubKey(ParseHex(CC.CChexstr))});
+                    tb.AddTransparentOutput(MakeMofNCCScript(CConditionObj<CCurrencyDefinition>(EVAL_CURRENCY_DEFINITION, dests, 1, &oneNewReserve.second)),
+                                                        CCurrencyDefinition::DEFAULT_OUTPUT_VALUE);
+                }
+
+                if (newChain.IsGateway() &&
+                    newChain.notaries.size() &&
+                    (newChain.notarizationProtocol == newChain.NOTARIZATION_AUTO ||
+                    newChain.notarizationProtocol == newChain.NOTARIZATION_NOTARY_CONFIRM))
+                {
+                    // notaries all get an even share of 10% of a currency launch fee to use for notarizing
+                    notaryFeeShare = ConnectedChains.ThisChain().GetCurrencyRegistrationFee(newChain.options) / 100;
+                    totalLaunchFee -= notaryFeeShare;
+                    CAmount oneNotaryShare = notaryFeeShare / newChain.notaries.size();
+                    CAmount notaryModExtra = notaryFeeShare % newChain.notaries.size();
+                    for (auto &oneNotary : newChain.notaries)
                     {
-                        CAmount contribution = newGatewayConverter.contributions[i] +
-                                                CReserveTransactionDescriptor::CalculateAdditionalConversionFee(newGatewayConverter.contributions[i]);
-                        CAmount fee = CReserveTransfer::DEFAULT_PER_STEP_FEE << 1;
+                        tb.AddTransparentOutput(CIdentityID(oneNotary), notaryModExtra ? notaryModExtra--, oneNotaryShare + 1 : oneNotaryShare);
+                    }
+                }
 
-                        CReserveTransfer rt = CReserveTransfer(CReserveTransfer::VALID + CReserveTransfer::PRECONVERT,
-                                                            newGatewayConverter.currencies[i],
-                                                            contribution,
-                                                            ASSETCHAINS_CHAINID,
-                                                            fee,
-                                                            gatewayCurrencyID,
-                                                            DestinationToTransferDestination(CIdentityID(gatewayCurrencyID)));
+                newGatewayConverter.gatewayConverterIssuance = newChain.gatewayConverterIssuance;
 
-                        cp = CCinit(&CC, EVAL_RESERVE_TRANSFER);
-                        CPubKey pk(ParseHex(CC.CChexstr));
+                cp = CCinit(&CC, EVAL_CURRENCY_DEFINITION);
+                std::vector<CTxDestination> dests({CPubKey(ParseHex(CC.CChexstr))});
+                tb.AddTransparentOutput(MakeMofNCCScript(CConditionObj<CCurrencyDefinition>(EVAL_CURRENCY_DEFINITION, dests, 1, &newGatewayConverter)),
+                                                    CCurrencyDefinition::DEFAULT_OUTPUT_VALUE);
 
-                        dests = std::vector<CTxDestination>({pk.GetID()});
+                // get initial currency state at this height
+                CCoinbaseCurrencyState gatewayCurrencyState = ConnectedChains.GetCurrencyState(newGatewayConverter, chainActive.Height() + 1);
+                int currencyIndex = gatewayCurrencyState.GetReserveMap()[newChainID];
 
-                        tb.AddTransparentOutput(MakeMofNCCScript(CConditionObj<CReserveTransfer>(EVAL_RESERVE_TRANSFER, dests, 1, &rt)),
-                                                            newGatewayConverter.currencies[i] == thisChainID ? contribution + fee : fee);
+                gatewayCurrencyState.reserveIn[currencyIndex] += newChain.gatewayConverterIssuance;
+
+                uint160 gatewayCurrencyID = newGatewayConverter.GetID();
+
+                CPBaaSNotarization gatewayPbn = CPBaaSNotarization(gatewayCurrencyID,
+                                                                gatewayCurrencyState,
+                                                                height,
+                                                                CUTXORef(),
+                                                                0);
+
+                // launch notarizations are on this chain
+                gatewayPbn.SetSameChain();
+                gatewayPbn.SetPreLaunch();
+                gatewayPbn.SetDefinitionNotarization();
+
+                // create import and export outputs
+                cp = CCinit(&CC, EVAL_CROSSCHAIN_IMPORT);
+                pk = CPubKey(ParseHex(CC.CChexstr));
+
+                if (newGatewayConverter.proofProtocol == newGatewayConverter.PROOF_PBAASMMR ||
+                    newGatewayConverter.proofProtocol == newGatewayConverter.PROOF_CHAINID ||
+                    newGatewayConverter.proofProtocol == newGatewayConverter.PROOF_ETHNOTARIZATION)
+                {
+                    dests = std::vector<CTxDestination>({pk.GetID()});
+                }
+                else
+                {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "None or invalid notarization protocol specified");
+                }
+
+                // if this is a token on this chain, the transfer that is output here is burned through the export
+                // and merges with the import thread. we multiply new input times 2, to cover both the import thread output
+                // and the reserve transfer outputs.
+                CCrossChainImport gatewayCci = CCrossChainImport(newGatewayConverter.systemID, lastImportHeight, gatewayCurrencyID, CCurrencyValueMap(), CCurrencyValueMap());
+                gatewayCci.SetSameChain(newGatewayConverter.systemID == ASSETCHAINS_CHAINID);
+                gatewayCci.SetDefinitionImport(true);
+
+                tb.AddTransparentOutput(MakeMofNCCScript(CConditionObj<CCrossChainImport>(EVAL_CROSSCHAIN_IMPORT, dests, 1, &gatewayCci)), 0);
+
+                // make the first chain notarization output
+                cp = CCinit(&CC, EVAL_ACCEPTEDNOTARIZATION);
+                CTxDestination notarizationDest;
+
+                if (newGatewayConverter.notarizationProtocol == newGatewayConverter.NOTARIZATION_AUTO ||
+                    newGatewayConverter.notarizationProtocol == newGatewayConverter.NOTARIZATION_NOTARY_CONFIRM ||
+                    newGatewayConverter.notarizationProtocol == newGatewayConverter.NOTARIZATION_NOTARY_CHAINID)
+                {
+                    notarizationDest = CPubKey(ParseHex(CC.CChexstr));
+                }
+                else
+                {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "None or notarization protocol specified");
+                }
+
+                dests = std::vector<CTxDestination>({notarizationDest});
+
+                tb.AddTransparentOutput(MakeMofNCCScript(CConditionObj<CPBaaSNotarization>(EVAL_ACCEPTEDNOTARIZATION, dests, 1, &gatewayPbn)),
+                                                    CPBaaSNotarization::MIN_NOTARIZATION_OUTPUT);
+
+                converterImportFee = ConnectedChains.ThisChain().LaunchFeeImportShare(newGatewayConverter.options);
+                converterImportFees.valueMap[thisChainID] += converterImportFee;
+
+                // export thread
+                cp = CCinit(&CC, EVAL_CROSSCHAIN_EXPORT);
+                dests = std::vector<CTxDestination>({CPubKey(ParseHex(CC.CChexstr))});
+                CCrossChainExport gatewayCcx = CCrossChainExport(thisChainID, 0, height, newGatewayConverter.systemID, gatewayCurrencyID, 0, converterImportFees, converterImportFees, uint256());
+                gatewayCcx.SetPreLaunch();
+                gatewayCcx.SetChainDefinition();
+
+                tb.AddTransparentOutput(MakeMofNCCScript(CConditionObj<CCrossChainExport>(EVAL_CROSSCHAIN_EXPORT, dests, 1, &gatewayCcx)), 0);
+
+                // make the outputs for initial contributions
+                if (newGatewayConverter.contributions.size() && newGatewayConverter.contributions.size() == newGatewayConverter.currencies.size())
+                {
+                    for (int i = 0; i < newGatewayConverter.currencies.size(); i++)
+                    {
+                        if (newGatewayConverter.contributions[i] > 0)
+                        {
+                            CAmount contribution = newGatewayConverter.contributions[i] +
+                                                    CReserveTransactionDescriptor::CalculateAdditionalConversionFee(newGatewayConverter.contributions[i]);
+                            CAmount fee = CReserveTransfer::DEFAULT_PER_STEP_FEE << 1;
+
+                            CReserveTransfer rt = CReserveTransfer(CReserveTransfer::VALID + CReserveTransfer::PRECONVERT,
+                                                                newGatewayConverter.currencies[i],
+                                                                contribution,
+                                                                ASSETCHAINS_CHAINID,
+                                                                fee,
+                                                                gatewayCurrencyID,
+                                                                DestinationToTransferDestination(CIdentityID(gatewayCurrencyID)));
+
+                            cp = CCinit(&CC, EVAL_RESERVE_TRANSFER);
+                            CPubKey pk(ParseHex(CC.CChexstr));
+
+                            dests = std::vector<CTxDestination>({pk.GetID()});
+
+                            tb.AddTransparentOutput(MakeMofNCCScript(CConditionObj<CReserveTransfer>(EVAL_RESERVE_TRANSFER, dests, 1, &rt)),
+                                                                newGatewayConverter.currencies[i] == thisChainID ? contribution + fee : fee);
+                        }
                     }
                 }
             }
@@ -12684,8 +12718,7 @@ UniValue registeridentity(const UniValue& params, bool fHelp)
     int64_t expectedFee = referralID.IsNull() ? feeOffer : feeOffer - idReferralFee;
 
     if (issuingCurrency.proofProtocol == issuingCurrency.PROOF_CHAINID &&
-        (issuingCurrency.endBlock == 0 ||
-         issuingCurrency.endBlock < height))
+        (issuingCurrency.endBlock == 0 || height < issuingCurrency.endBlock))
     {
         if (issuerID == ASSETCHAINS_CHAINID)
         {
@@ -12841,8 +12874,7 @@ UniValue registeridentity(const UniValue& params, bool fHelp)
     if (registrationPaymentOut >= 0)
     {
         if (issuingCurrency.proofProtocol == issuingCurrency.PROOF_CHAINID &&
-            (issuingCurrency.endBlock == 0 ||
-             issuingCurrency.endBlock < height))
+            (issuingCurrency.endBlock == 0 || height < issuingCurrency.endBlock))
         {
             if (issuerID == ASSETCHAINS_CHAINID)
             {

@@ -1205,6 +1205,9 @@ public:
     bool IsUpgradeActive(const uint160 &upgradeID, uint32_t blockHeight=UINT32_MAX, uint32_t blockTime=UINT32_MAX) const;
     uint32_t GetZeroViaHeight(bool getVerusHeight) const;
     bool CheckZeroViaOnlyPostLaunch(uint32_t height) const;
+    uint32_t IncludePostLaunchFeeHeight(bool getVerusHeight) const;
+    bool IncludePostLaunchFees(uint32_t height) const;
+    bool StartIncludePostLaunchFees(uint32_t height) const;
     bool CheckClearConvert(uint32_t height) const;
 
     std::vector<CCurrencyDefinition> GetMergeMinedChains()

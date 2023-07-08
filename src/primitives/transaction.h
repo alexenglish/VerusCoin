@@ -1465,6 +1465,19 @@ public:
         return uint256();
     }
 
+    uint256 GetRootPower() const
+    {
+        if (type == TYPE_PBAAS && IsChainProof())
+        {
+            std::vector<uint256> &branch = ((CMMRPowerNodeBranch *)(txProof.proofSequence[2]))->branch;
+            if (branch.size() >= 1)
+            {
+                return branch.back();
+            }
+        }
+        return uint256();
+    }
+
     uint32_t GetBlockHeight() const
     {
         if ((type == TYPE_PBAAS || type == TYPE_FULLTX) && IsChainProof())

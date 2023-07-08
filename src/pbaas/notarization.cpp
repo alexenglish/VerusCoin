@@ -1156,9 +1156,17 @@ bool CPBaaSNotarization::NextNotarizationInfo(const CCurrencyDefinition &sourceS
                              proofRoots.find(VERUS_CHAINID)->second.rootHeight >= ConnectedChains.GetZeroViaHeight(PBAAS_TESTMODE)) ||
                             (ConnectedChains.CheckZeroViaOnlyPostLaunch(currentHeight));
 
+    bool includePostLaunchFees = ConnectedChains.IncludePostLaunchFees(currentHeight) &&
+                                 !(destCurrency.IsGatewayConverter() && destCurrency.systemID != destCurrency.launchSystemID) &&
+                                 destCurrency.IsFractional();
+
     bool clearConvert = ConnectedChains.CheckClearConvert(notaHeight);
 
-    CTransferDestination notaryPayee;
+    CCoinbaseCurrencyState::ReversionUpdate reversionUpdate = !improvedMinCheck ?
+                                                                CCoinbaseCurrencyState::PBAAS_1_0_0 :
+                                                                !clearConvert ?
+                                                                    CCoinbaseCurrencyState::PBAAS_1_0_8 :
+                                                                    CCoinbaseCurrencyState::ReversionUpdateForHeight(chainActive.Height());
 
     if (!externalSystemID.IsNull())
     {
@@ -1299,17 +1307,15 @@ bool CPBaaSNotarization::NextNotarizationInfo(const CCurrencyDefinition &sourceS
         if (((thisIsLaunchSys && notaHeight == (destCurrency.startBlock - 1)) || isBlockOnePBaaSLaunchNotarization) &&
             newNotarization.IsPreLaunch())
         {
+            bool initialPBaaSStart = destCurrency.IsGatewayConverter() || destCurrency.IsPBaaSChain();
+
             // the first block executes the second time through
             if (newNotarization.IsLaunchCleared())
             {
                 newNotarization.SetPreLaunch(false);
                 newNotarization.currencyState.SetLaunchClear();
                 newNotarization.currencyState.SetPrelaunch(false);
-                newNotarization.currencyState.RevertReservesAndSupply(destCurrency.systemID, false, improvedMinCheck ?
-                                                                                                        (clearConvert ?
-                                                                                                            CCoinbaseCurrencyState::PBAAS_1_0_10 :
-                                                                                                            CCoinbaseCurrencyState::PBAAS_1_0_8) :
-                                                                                                        CCoinbaseCurrencyState::PBAAS_1_0_0);
+                newNotarization.currencyState.RevertReservesAndSupply(destCurrency, destCurrency.systemID, initialPBaaSStart, reversionUpdate);
             }
             else
             {
@@ -1497,17 +1503,21 @@ bool CPBaaSNotarization::NextNotarizationInfo(const CCurrencyDefinition &sourceS
         // chain must be either output to specific addresses, taken as fees by miners, or stored in reserve deposits.
         if (!newNotarization.IsRefunding() && tempState.IsPrelaunch())
         {
-            if (improvedMinCheck && (destCurrency.IsPBaaSChain() || (destCurrency.IsGatewayConverter() && destSystemID != destCurrency.launchSystemID)))
+            if (improvedMinCheck &&
+                (destCurrency.IsPBaaSChain() ||
+                 (destCurrency.IsGatewayConverter() &&
+                  destSystemID != destCurrency.launchSystemID)))
             {
-                // total up all reserves entered in prelaunch except fees, even if refunded
+                // total up all reserves entered in prelaunch except fees
                 auto currencyIdxMap = tempState.GetReserveMap();
                 for (auto &oneCurrencyID : tempState.currencies)
                 {
+                    int idx = currencyIdxMap[oneCurrencyID];
+                    tempState.primaryCurrencyIn[idx] = this->currencyState.primaryCurrencyIn[idx];
+
                     if (rtxd.currencies.count(oneCurrencyID))
                     {
-                        int idx = currencyIdxMap[oneCurrencyID];
-                        tempState.primaryCurrencyIn[idx] = this->currencyState.primaryCurrencyIn[idx] +
-                            (rtxd.currencies[oneCurrencyID].reserveIn - tempState.fees[idx]);
+                        tempState.primaryCurrencyIn[idx] += (rtxd.currencies[oneCurrencyID].reserveIn - tempState.fees[idx]);
                     }
                 }
             }
@@ -1519,7 +1529,11 @@ bool CPBaaSNotarization::NextNotarizationInfo(const CCurrencyDefinition &sourceS
                 tempState.primaryCurrencyOut += this->currencyState.primaryCurrencyOut;
             }
         }
-        else if (!newNotarization.currencyState.IsLaunchCompleteMarker() && !tempState.IsRefunding() && !this->currencyState.IsPrelaunch())
+        else if (!newNotarization.currencyState.IsLaunchCompleteMarker() &&
+                 !tempState.IsRefunding() &&
+                 (includePostLaunchFees && improvedMinCheck && tempState.IsFractional() ?
+                    !newNotarization.currencyState.IsPrelaunch()  :
+                    !this->currencyState.IsPrelaunch()))
         {
             // accumulate reserves during pre-conversions import to enforce max pre-convert
             CCurrencyValueMap tempReserves;
@@ -1528,17 +1542,27 @@ bool CPBaaSNotarization::NextNotarizationInfo(const CCurrencyDefinition &sourceS
             bool newCumulative = improvedMinCheck && tempState.IsFractional();
             for (auto &oneCurrencyID : tempState.currencies)
             {
-                if (rtxd.currencies.count(oneCurrencyID))
-                {
-                    int64_t reservesIn = newCumulative ?
-                        oneCurrencyID == ASSETCHAINS_CHAINID ?
-                            (rtxd.nativeIn - rtxd.nativeOut) :
-                            (rtxd.currencies[oneCurrencyID].reserveIn - (rtxd.currencies[oneCurrencyID].reserveConversionFees + rtxd.currencies[oneCurrencyID].reserveOut)) :
-                        rtxd.currencies[oneCurrencyID].nativeOutConverted;
+                int64_t reservesIn;
 
-                    if (newCumulative)
+                if (!includePostLaunchFees && !rtxd.currencies.count(oneCurrencyID))
+                {
+                    continue;
+                }
+
+                if (newCumulative)
+                {
+                    reservesIn = oneCurrencyID == ASSETCHAINS_CHAINID ?
+                        (rtxd.nativeIn - rtxd.nativeOut) :
+                        (rtxd.currencies[oneCurrencyID].reserveIn - rtxd.currencies[oneCurrencyID].reserveOut);
+
+                    int idx = currencyIdxMap[oneCurrencyID];
+                    if (includePostLaunchFees)
                     {
-                        int idx = currencyIdxMap[oneCurrencyID];
+                        tempState.primaryCurrencyIn[idx] = newNotarization.currencyState.primaryCurrencyIn[idx] + (tempState.reserveIn[idx] - tempState.fees[idx]);
+                    }
+                    else
+                    {
+                        reservesIn -= (oneCurrencyID == ASSETCHAINS_CHAINID ? 0 : rtxd.currencies[oneCurrencyID].reserveConversionFees);
                         if (oneCurrencyID == ASSETCHAINS_CHAINID)
                         {
                             tempState.primaryCurrencyIn[idx] =
@@ -1549,11 +1573,15 @@ bool CPBaaSNotarization::NextNotarizationInfo(const CCurrencyDefinition &sourceS
                             tempState.primaryCurrencyIn[idx] = this->currencyState.primaryCurrencyIn[idx] + reservesIn;
                         }
                     }
+                }
+                else
+                {
+                    reservesIn = rtxd.currencies[oneCurrencyID].nativeOutConverted;
+                }
 
-                    if (reservesIn)
-                    {
-                        tempReserves.valueMap[oneCurrencyID] = reservesIn;
-                    }
+                if (reservesIn)
+                {
+                    tempReserves.valueMap[oneCurrencyID] = reservesIn;
                 }
             }
 
@@ -1565,10 +1593,15 @@ bool CPBaaSNotarization::NextNotarizationInfo(const CCurrencyDefinition &sourceS
             {
                 tempState.primaryCurrencyIn = tempState.AddVectors(this->currencyState.primaryCurrencyIn, tempReserves.AsCurrencyVector(tempState.currencies));
             }
-            tempState.reserveOut =
-                    tempState.AddVectors(tempState.reserveOut,
-                                         (CCurrencyValueMap(tempState.currencies, tempState.reserveIn) * -1).AsCurrencyVector(tempState.currencies));
-            if (!lastImportBeforeComplete)
+
+            if (!(includePostLaunchFees && improvedMinCheck && tempState.IsFractional()))
+            {
+                tempState.reserveOut =
+                        tempState.AddVectors(tempState.reserveOut,
+                                            (CCurrencyValueMap(tempState.currencies, tempState.reserveIn) * -1).AsCurrencyVector(tempState.currencies));
+            }
+
+            if (!lastImportBeforeComplete && !includePostLaunchFees)
             {
                 tempState.reserveIn = tempReserves.AsCurrencyVector(tempState.currencies);
             }
@@ -1661,25 +1694,22 @@ bool CPBaaSNotarization::NextNotarizationInfo(const CCurrencyDefinition &sourceS
                             bool isPBaaSBridge = destCurrency.IsGatewayConverter() && destCurrency.systemID == ASSETCHAINS_CHAINID;
                             for (auto &oneCurrencyID : tempState.currencies)
                             {
-                                if (rtxd.currencies.count(oneCurrencyID))
-                                {
-                                    int64_t reservesIn = newCumulative ?
-                                        oneCurrencyID == ASSETCHAINS_CHAINID ?
-                                            (isPBaaSBridge ? 0 : (rtxd.nativeIn - rtxd.nativeOut)) :
-                                            (rtxd.currencies[oneCurrencyID].reserveIn - (rtxd.currencies[oneCurrencyID].reserveConversionFees + rtxd.currencies[oneCurrencyID].reserveOut)) :
-                                        rtxd.currencies[oneCurrencyID].nativeOutConverted;
+                                int64_t reservesIn = newCumulative ?
+                                    oneCurrencyID == ASSETCHAINS_CHAINID ?
+                                        (isPBaaSBridge ? 0 : (rtxd.nativeIn - rtxd.nativeOut)) :
+                                        (rtxd.currencies[oneCurrencyID].reserveIn - (rtxd.currencies[oneCurrencyID].reserveConversionFees + rtxd.currencies[oneCurrencyID].reserveOut)) :
+                                    rtxd.currencies[oneCurrencyID].nativeOutConverted;
 
-                                    int idx = currencyIdxMap[oneCurrencyID];
-                                    if (newCumulative && oneCurrencyID == ASSETCHAINS_CHAINID)
-                                    {
-                                        tempState.reserveIn[idx] = (rtxd.nativeIn + tempState.reserveOut[idx]) - rtxd.nativeOut;
-                                    }
-                                    else
-                                    {
-                                        tempState.reserveIn[idx] = reservesIn;
-                                    }
-                                    tempState.primaryCurrencyIn[idx] = this->currencyState.primaryCurrencyIn[idx] + tempState.reserveIn[idx];
+                                int idx = currencyIdxMap[oneCurrencyID];
+                                if (newCumulative && oneCurrencyID == ASSETCHAINS_CHAINID)
+                                {
+                                    tempState.reserveIn[idx] = (rtxd.nativeIn + tempState.reserveOut[idx]) - rtxd.nativeOut;
                                 }
+                                else
+                                {
+                                    tempState.reserveIn[idx] = reservesIn;
+                                }
+                                tempState.primaryCurrencyIn[idx] = this->currencyState.primaryCurrencyIn[idx] + tempState.reserveIn[idx];
                             }
                         }
                     }
@@ -1693,16 +1723,13 @@ bool CPBaaSNotarization::NextNotarizationInfo(const CCurrencyDefinition &sourceS
                     auto currencyIdxMap = newNotarization.currencyState.GetReserveMap();
                     for (auto &oneCurrencyID : newNotarization.currencyState.currencies)
                     {
-                        if (rtxd.currencies.count(oneCurrencyID))
+                        if (oneCurrencyID == destSystem.GetID())
                         {
-                            if (oneCurrencyID == destSystem.GetID())
-                            {
-                                continue;
-                            }
-                            int idx = currencyIdxMap[oneCurrencyID];
-                            newNotarization.currencyState.reserveIn[idx] = rtxd.currencies[oneCurrencyID].nativeOutConverted;
-                            newNotarization.currencyState.primaryCurrencyIn[idx] = this->currencyState.primaryCurrencyIn[idx] + newNotarization.currencyState.reserveIn[idx];
+                            continue;
                         }
+                        int idx = currencyIdxMap[oneCurrencyID];
+                        newNotarization.currencyState.reserveIn[idx] = rtxd.currencies[oneCurrencyID].nativeOutConverted;
+                        newNotarization.currencyState.primaryCurrencyIn[idx] = this->currencyState.primaryCurrencyIn[idx] + newNotarization.currencyState.reserveIn[idx];
                     }
                 }
                 importOutputs.insert(importOutputs.end(), dummyImportOutputs.begin(), dummyImportOutputs.end());
@@ -1983,13 +2010,6 @@ UniValue CChainNotarizationData::ToUniValue(const std::vector<std::pair<CTransac
         notarization.push_back(Pair("index", i));
         notarization.push_back(Pair("txid", vtx[i].first.hash.GetHex()));
 
-        if (IsConfirmed())
-        {
-            notarization.pushKV("notarizationmodulo", CPBaaSNotarization::GetAdjustedNotarizationModulo(ConnectedChains.ThisChain().blockNotarizationModulo,
-                                                                                                        (int32_t)vtx[lastConfirmed].second.notarizationHeight,
-                                                                                                        chainActive.Height() + 1));
-        }
-
         if (i < transactionsAndBlockHash.size())
         {
             notarization.push_back(Pair("blockhash", transactionsAndBlockHash[i].second.GetHex()));
@@ -2045,7 +2065,18 @@ UniValue CChainNotarizationData::ToUniValue(const std::vector<std::pair<CTransac
     if (IsConfirmed())
     {
         obj.push_back(Pair("lastconfirmedheight", (int32_t)vtx[lastConfirmed].second.notarizationHeight));
+        if (transactionsAndBlockHash.size() > lastConfirmed)
+        {
+            auto blockIt = mapBlockIndex.find(transactionsAndBlockHash[lastConfirmed].second);
+            if (blockIt != mapBlockIndex.end())
+            {
+                obj.pushKV("notarizationmodulo", CPBaaSNotarization::GetAdjustedNotarizationModulo(ConnectedChains.ThisChain().blockNotarizationModulo,
+                                                                                                            (int32_t)blockIt->second->GetHeight(),
+                                                                                                            chainActive.Height() + 1));
+            }
+        }
     }
+
     obj.push_back(Pair("lastconfirmed", lastConfirmed));
     obj.push_back(Pair("bestchain", bestChain));
     return obj;
@@ -2513,7 +2544,19 @@ std::tuple<uint32_t, CTransaction, CUTXORef, CPBaaSNotarization> GetPriorReferen
                         }
                         else
                         {
-                            lastNotarizationAddressEntry = lastNotarizationIndexes.back();
+                            int i;
+                            for (i = 0; i < lastOfs.size(); i++)
+                            {
+                                if (lastOfs[i].IsValid())
+                                {
+                                    lastNotarizationAddressEntry = lastNotarizationIndexes[i];
+                                    break;
+                                }
+                            }
+                            if (i >= lastOfs.size())
+                            {
+                                lastNotarizationAddressEntry = lastNotarizationIndexes.back();
+                            }
                         }
                     }
                     else
@@ -3114,6 +3157,7 @@ CPBaaSNotarization IsValidPrimaryChainEvidence(const CCurrencyDefinition &extern
                         bool isPartial = false;
                         uint256 txMMRRoot = ((CChainObject<CPartialTransactionProof> *)proofComponent)->object.CheckPartialTransaction(outTx, &isPartial);
                         uint256 txHash = ((CChainObject<CPartialTransactionProof> *)proofComponent)->object.TransactionHash();
+                        uint256 rootPower = ((CChainObject<CPartialTransactionProof> *)proofComponent)->object.GetRootPower();
 
                         if (LogAcceptCategory("notarization"))
                         {
@@ -3122,26 +3166,30 @@ CPBaaSNotarization IsValidPrimaryChainEvidence(const CCurrencyDefinition &extern
                             UniValue jsonTx(UniValue::VOBJ);
                             uint256 blockHash;
                             TxToUniv(outTx, blockHash, jsonTx);
-                            printf("%s: proof for transaction %s\nwith txid: %s\nproof: %s\nat height: %u, proofheight: %u\n",
+                            printf("%s: proof for transaction %s\nwith txid: %s\nproof: %s\nat height: %u, proofheight: %u, rootpower: %s\n",
                                     __func__,
                                     jsonTx.write(1,2).c_str(),
                                     txHash.GetHex().c_str(),
                                     ((CChainObject<CPartialTransactionProof> *)proofComponent)->object.ToUniValue().write(1,2).c_str(),
                                     ((CChainObject<CPartialTransactionProof> *)proofComponent)->object.GetBlockHeight(),
-                                    ((CChainObject<CPartialTransactionProof> *)proofComponent)->object.GetProofHeight());
-                            LogPrintf("%s: proof for transaction %s\nwith txid: %s\nproof: %s\nat height: %u, proofheight: %u\n",
+                                    ((CChainObject<CPartialTransactionProof> *)proofComponent)->object.GetProofHeight(),
+                                    rootPower.GetHex().c_str());
+                            LogPrintf("%s: proof for transaction %s\nwith txid: %s\nproof: %s\nat height: %u, proofheight: %u, rootpower: %s\n",
                                     __func__,
                                     jsonTx.write(1,2).c_str(),
                                     txHash.GetHex().c_str(),
                                     ((CChainObject<CPartialTransactionProof> *)proofComponent)->object.ToUniValue().write(1,2).c_str(),
                                     ((CChainObject<CPartialTransactionProof> *)proofComponent)->object.GetBlockHeight(),
-                                    ((CChainObject<CPartialTransactionProof> *)proofComponent)->object.GetProofHeight());
+                                    ((CChainObject<CPartialTransactionProof> *)proofComponent)->object.GetProofHeight(),
+                                    rootPower.GetHex().c_str());
                         }
 
                         // find the last notarization on the transaction. if we need more proof to address a challenge, we will need to retain this
                         // either the notarization is the block 1 coinbase proof, or it is a proof of a transaction on the other chain that corresponds
                         // to a confirmed or pending transaction on this chain.
-                        if (txMMRRoot == provenNotarization.proofRoots[provenNotarization.currencyID].stateRoot)
+                        CProofRoot &checkRoot = provenNotarization.proofRoots[provenNotarization.currencyID];
+                        if (txMMRRoot == checkRoot.stateRoot &&
+                            rootPower == checkRoot.compactPower)
                         {
                             for (auto &oneOut : outTx.vout)
                             {
@@ -3280,7 +3328,19 @@ CPBaaSNotarization IsValidPrimaryChainEvidence(const CCurrencyDefinition &extern
                                             }
                                             else
                                             {
-                                                lastNotarizationAddressEntry = lastNotarizationIndexes.back();
+                                                int i;
+                                                for (i = 0; i < lastOfs.size(); i++)
+                                                {
+                                                    if (lastOfs[i].IsValid())
+                                                    {
+                                                        lastNotarizationAddressEntry = lastNotarizationIndexes[i];
+                                                        break;
+                                                    }
+                                                }
+                                                if (i >= lastOfs.size())
+                                                {
+                                                    lastNotarizationAddressEntry = lastNotarizationIndexes.back();
+                                                }
                                             }
                                         }
                                         else
@@ -8526,6 +8586,7 @@ bool CPBaaSNotarization::FindFinalizedIndexesByVDXFKey(const uint160 &notarizati
         uint256 blkHash;
         COptCCParams fP;
 
+        std::vector<CObjectFinalization> validOfs;
         for (auto &oneIndexEntry : addressIndex)
         {
             if (oneIndexEntry.first.spending)
@@ -8534,9 +8595,9 @@ bool CPBaaSNotarization::FindFinalizedIndexesByVDXFKey(const uint160 &notarizati
             }
             if (!myGetTransaction(finalizationIndex.first.txhash, finalizationTx, blkHash) ||
                 finalizationIndex.first.index >= finalizationTx.vout.size() ||
-                blkHash.IsNull() ||
-                (blockIt = mapBlockIndex.find(blkHash)) == mapBlockIndex.end() ||
-                !chainActive.Contains(blockIt->second) ||
+                (!blkHash.IsNull() &&
+                 ((blockIt = mapBlockIndex.find(blkHash)) == mapBlockIndex.end() ||
+                  !chainActive.Contains(blockIt->second))) ||
                 !(finalizationTx.vout[finalizationIndex.first.index].scriptPubKey.IsPayToCryptoCondition(fP) &&
                     fP.IsValid() &&
                     fP.evalCode == EVAL_FINALIZE_NOTARIZATION &&
@@ -8544,7 +8605,14 @@ bool CPBaaSNotarization::FindFinalizedIndexesByVDXFKey(const uint160 &notarizati
                     (confirmedFinalization[i] = CObjectFinalization(fP.vData[0])).IsValid()))
             {
                 LogPrint("notarization", "Invalid finalization transaction for index key\n");
+                continue;
             }
+            validOfs.push_back(confirmedFinalization[i]);
+            break;
+        }
+        if (validOfs.size())
+        {
+            confirmedFinalization[i] = validOfs[0];
         }
     }
     return true;
