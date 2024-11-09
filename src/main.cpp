@@ -88,7 +88,8 @@ bool fImporting = false;
 bool fReindex = false;
 bool fTxIndex = true;
 bool fIdIndex = false;
-bool fInsightExplorer = false;       // this ensures that the primary address and spent indexes are active, enabling advanced CCs
+bool fConversionIndex = false;      // index conversions by final destination
+bool fInsightExplorer = false;      // this ensures that the primary address and spent indexes are active, enabling advanced CCs
 bool fAddressIndex = true;
 bool fSpentIndex = true;
 bool fTimestampIndex = false;
@@ -112,12 +113,24 @@ CFeeRate minRelayTxFee = CFeeRate(DEFAULT_MIN_RELAY_TX_FEE);
 
 CTxMemPool mempool(::minRelayTxFee);
 
+LRUCache<std::pair<uint256, uint32_t>, std::tuple<uint256, CInputDescriptor, CReserveTransfer>> reserveTransferCache(6000); // reserve transfers are entered here as processed, <<txid, outnum>, <blockHash, CInputDescriptor, CReserveTransfer>>
+
+struct IteratorComparator
+{
+    template<typename I>
+    bool operator()(const I& a, const I& b) const
+    {
+        return &(*a) < &(*b);
+    }
+};
+
 struct COrphanTx {
     CTransaction tx;
     NodeId fromPeer;
+    int64_t nTimeExpire;
 };
-map<uint256, COrphanTx> mapOrphanTransactions GUARDED_BY(cs_main);;
-map<uint256, set<uint256> > mapOrphanTransactionsByPrev GUARDED_BY(cs_main);;
+map<uint256, COrphanTx> mapOrphanTransactions GUARDED_BY(cs_main);
+map<COutPoint, set<map<uint256, COrphanTx>::iterator, IteratorComparator>> mapOrphanTransactionsByPrev GUARDED_BY(cs_main);
 void EraseOrphansFor(NodeId peer) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
 /**
@@ -126,6 +139,11 @@ void EraseOrphansFor(NodeId peer) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
  */
 static bool IsSuperMajority(int minVersion, const CBlockIndex* pstart, unsigned nRequired, const Consensus::Params& consensusParams);
 static void CheckBlockIndex(const Consensus::Params& consensusParams);
+
+uint32_t GetLatestHeight()
+{
+    return chainActive.Height();
+}
 
 /** Constant stuff for coinbase transactions we create: */
 CScript COINBASE_FLAGS;
@@ -644,40 +662,42 @@ bool AddOrphanTx(const CTransaction& tx, NodeId peer) EXCLUSIVE_LOCKS_REQUIRED(c
     // large transaction with a missing parent then we assume
     // it will rebroadcast it later, after the parent transaction(s)
     // have been mined or received.
-    // 10,000 orphans, each of which is at most 5,000 bytes big is
-    // at most 500 megabytes of orphans:
+    // 100 orphans, each of which is at most 99,999 bytes big is
+    // at most 10 megabytes of orphans and somewhat more byprev index (in the worst case):
     unsigned int sz = GetSerializeSize(tx, SER_NETWORK, tx.nVersion);
-    if (sz > 5000)
+    if (sz >= 100000)
     {
         LogPrint("mempool", "ignoring large orphan tx (size: %u, hash: %s)\n", sz, hash.ToString());
         return false;
     }
 
-    mapOrphanTransactions[hash].tx = tx;
-    mapOrphanTransactions[hash].fromPeer = peer;
-    BOOST_FOREACH(const CTxIn& txin, tx.vin)
-    mapOrphanTransactionsByPrev[txin.prevout.hash].insert(hash);
+    auto ret = mapOrphanTransactions.emplace(hash, COrphanTx{tx, peer, GetTime() + ORPHAN_TX_EXPIRE_TIME});
+    assert(ret.second);
+    for (const CTxIn& txin : tx.vin) {
+        mapOrphanTransactionsByPrev[txin.prevout].insert(ret.first);
+    }
 
-    LogPrint("mempool", "stored orphan tx %s (mapsz %u prevsz %u)\n", hash.ToString(),
+    LogPrint("mempool", "stored orphan tx %s (mapsz %u outsz %u)\n", hash.ToString(),
              mapOrphanTransactions.size(), mapOrphanTransactionsByPrev.size());
     return true;
 }
 
-void static EraseOrphanTx(uint256 hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+int static EraseOrphanTx(uint256 hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
 {
     map<uint256, COrphanTx>::iterator it = mapOrphanTransactions.find(hash);
     if (it == mapOrphanTransactions.end())
-        return;
-    BOOST_FOREACH(const CTxIn& txin, it->second.tx.vin)
+        return 0;
+    for (const CTxIn& txin : it->second.tx.vin)
     {
-        map<uint256, set<uint256> >::iterator itPrev = mapOrphanTransactionsByPrev.find(txin.prevout.hash);
+        auto itPrev = mapOrphanTransactionsByPrev.find(txin.prevout);
         if (itPrev == mapOrphanTransactionsByPrev.end())
             continue;
-        itPrev->second.erase(hash);
+        itPrev->second.erase(it);
         if (itPrev->second.empty())
             mapOrphanTransactionsByPrev.erase(itPrev);
     }
     mapOrphanTransactions.erase(it);
+    return 1;
 }
 
 void EraseOrphansFor(NodeId peer)
@@ -689,8 +709,7 @@ void EraseOrphansFor(NodeId peer)
         map<uint256, COrphanTx>::iterator maybeErase = iter++; // increment to avoid iterator becoming invalid
         if (maybeErase->second.fromPeer == peer)
         {
-            EraseOrphanTx(maybeErase->second.tx.GetHash());
-            ++nErased;
+            nErased += EraseOrphanTx(maybeErase->second.tx.GetHash());
         }
     }
     if (nErased > 0) LogPrint("mempool", "Erased %d orphan tx from peer %d\n", nErased, peer);
@@ -700,6 +719,28 @@ void EraseOrphansFor(NodeId peer)
 unsigned int LimitOrphanTxSize(unsigned int nMaxOrphans) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
 {
     unsigned int nEvicted = 0;
+    static int64_t nNextSweep;
+    int64_t nNow = GetTime();
+    if (nNextSweep <= nNow) {
+        // Sweep out expired orphan pool entries:
+        int nErased = 0;
+        assert(nNow <= INT64_MAX - ORPHAN_TX_EXPIRE_TIME);
+        int64_t nMinExpTime = nNow + ORPHAN_TX_EXPIRE_TIME - ORPHAN_TX_EXPIRE_INTERVAL;
+        map<uint256, COrphanTx>::iterator iter = mapOrphanTransactions.begin();
+        while (iter != mapOrphanTransactions.end())
+        {
+            map<uint256, COrphanTx>::iterator maybeErase = iter++;
+            if (maybeErase->second.nTimeExpire <= nNow) {
+                nErased += EraseOrphanTx(maybeErase->second.tx.GetHash());
+            } else {
+                nMinExpTime = std::min(maybeErase->second.nTimeExpire, nMinExpTime);
+            }
+        }
+        // Sweep again 5 minutes after the next entry that expires in order to batch the linear scan.
+        assert(nMinExpTime <= INT64_MAX - ORPHAN_TX_EXPIRE_INTERVAL);
+        nNextSweep = nMinExpTime + ORPHAN_TX_EXPIRE_INTERVAL;
+        if (nErased > 0) LogPrint("mempool", "Erased %d orphan tx due to expiration\n", nErased);
+    }
     while (mapOrphanTransactions.size() > nMaxOrphans)
     {
         // Evict a random orphan:
@@ -740,7 +781,7 @@ void InitializePremineSupply()
     }
 }
 
-bool IsStandardTx(const CTransaction& tx, string& reason, const CChainParams& chainparams, const int nHeight)
+bool IsStandardTx(const CTransaction& tx, string& reason, bool fLimitDust, const CChainParams& chainparams, const int nHeight)
 {
     bool overwinterActive = chainparams.GetConsensus().NetworkUpgradeActive(nHeight,  Consensus::UPGRADE_OVERWINTER);
     bool saplingActive = chainparams.GetConsensus().NetworkUpgradeActive(nHeight, Consensus::UPGRADE_SAPLING);
@@ -817,6 +858,8 @@ bool IsStandardTx(const CTransaction& tx, string& reason, const CChainParams& ch
             return false;
         }
 
+        COptCCParams checkP;
+
         if (whichType == TX_NULL_DATA)
         {
             if ( txout.scriptPubKey.size() > IGUANA_MAXSCRIPTSIZE )
@@ -830,7 +873,7 @@ bool IsStandardTx(const CTransaction& tx, string& reason, const CChainParams& ch
         else if ((whichType == TX_MULTISIG) && (!fIsBareMultisigStd)) {
             reason = "bare-multisig";
             return false;
-        } else if (!txout.scriptPubKey.IsPayToCryptoCondition() && !tx.vout.back().scriptPubKey.IsOpReturn() && !isCoinbase && txout.IsDust(::minRelayTxFee)) {
+        } else if (fLimitDust && !txout.scriptPubKey.IsPayToCryptoCondition() && !tx.vout.back().scriptPubKey.IsOpReturn() && !isCoinbase && txout.IsDust(::minRelayTxFee)) {
             reason = "dust";
             return false;
         }
@@ -1756,6 +1799,89 @@ bool CheckTransactionWithoutProofVerification(const CTransaction& tx, CValidatio
     return true;
 }
 
+CAmount GetMinRelayFeeByOutputs(const CReserveTransactionDescriptor &txDesc, const CTransaction &tx, CValidationState &state, CAmount identityFeeFactor)
+{
+    // Require that free transactions have sufficient priority to be mined in the next block.
+    CAmount minFee = identityFeeFactor * DEFAULT_TRANSACTION_FEE;
+
+    // if we have more z-outputs + t-outputs than are needed for 1 z-output and change, increase fee
+    // we make allowance for 1 z-output or t-output, 1 native z-change, one token change, and 1 blacklisted change
+    int idExtraLimit = 0;
+    if (txDesc.IsIdentityDefinition())
+    {
+        for (auto &oneOut : tx.vout)
+        {
+            COptCCParams idP;
+            if (oneOut.scriptPubKey.IsPayToCryptoCondition(idP) &&
+                idP.evalCode == EVAL_IDENTITY_RESERVATION)
+            {
+                idExtraLimit = ConnectedChains.ThisChain().IDReferralLevels() + 2;
+            }
+            else if (idP.IsValid() &&
+                        idP.evalCode == EVAL_IDENTITY_ADVANCEDRESERVATION)
+            {
+                CAdvancedNameReservation advNewName;
+                if (!(idP.vData.size() && (advNewName = CAdvancedNameReservation(idP.vData[0])).IsValid()))
+                {
+                    return state.DoS(0, error("Invalid identity reservation"));
+                }
+                CCurrencyDefinition parentCurrency = advNewName.parent.IsNull() ? ConnectedChains.ThisChain() : ConnectedChains.GetCachedCurrency(advNewName.parent);
+                idExtraLimit = parentCurrency.IDReferralLevels() + 2;
+            }
+        }
+    }
+
+    if (!minFee)
+    {
+        minFee = DEFAULT_TRANSACTION_FEE;
+    }
+
+    if (tx.vout.size() > (3 + idExtraLimit))
+    {
+        minFee += (std::max((int64_t)(tx.vShieldedOutput.size() - 1), (int64_t)0) + std::max((int64_t)(tx.vout.size() - (3 + idExtraLimit)), (int64_t)0)) * DEFAULT_TRANSACTION_FEE;
+    }
+    else if (tx.vout.size() > (2 + idExtraLimit))
+    {
+        minFee += std::max((int64_t)(tx.vShieldedOutput.size() - 2), (int64_t)0) * DEFAULT_TRANSACTION_FEE;
+    }
+    else
+    {
+        minFee += std::max((int64_t)(tx.vShieldedOutput.size() - 3), (int64_t)0) * DEFAULT_TRANSACTION_FEE;
+    }
+
+    if (!(identityFeeFactor && tx.vout.size() <= (3 + idExtraLimit)) && !txDesc.IsImport() && !txDesc.IsNotaryPrioritized())
+    {
+        int64_t extraOutputCostThreshold = CScript::MAX_SCRIPT_ELEMENT_SIZE / 3;
+        int64_t extraStorageSpace = 0;
+        bool isStorageTx = txDesc.IsStorage();
+        for (int i = 0; i < tx.vout.size(); i++)
+        {
+            auto &oneOut = tx.vout[i];
+            int64_t extraSize = std::max((int64_t)oneOut.scriptPubKey.size() - extraOutputCostThreshold, (int64_t)0);
+            bool isOpRet = (i == (tx.vout.size() - 1)) && oneOut.scriptPubKey.IsOpReturn();
+
+            if (extraSize || isStorageTx)
+            {
+                COptCCParams evP;
+                if ((isStorageTx &&
+                     ((extraSize && isOpRet) ||
+                      (oneOut.scriptPubKey.IsPayToCryptoCondition(evP) &&
+                       evP.IsValid() &&
+                       evP.evalCode == EVAL_NOTARY_EVIDENCE))))
+                {
+                    extraStorageSpace += (int64_t)oneOut.scriptPubKey.size();
+                }
+                else if (extraSize)
+                {
+                    minFee += DEFAULT_TRANSACTION_FEE + ((extraSize - extraOutputCostThreshold) > 0 ? DEFAULT_TRANSACTION_FEE : 0);
+                }
+            }
+        }
+        minFee += (((int64_t)(extraStorageSpace)) * (STORAGE_FEE_FACTOR * ConnectedChains.ThisChain().transactionExportFee)) / CScript::MAX_SCRIPT_ELEMENT_SIZE;
+    }
+    return minFee;
+}
+
 CAmount GetMinRelayFee(const CTransaction& tx, unsigned int nBytes, bool fAllowFree)
 {
     extern int32_t KOMODO_ON_DEMAND;
@@ -1786,7 +1912,7 @@ CAmount GetMinRelayFee(const CTransaction& tx, unsigned int nBytes, bool fAllowF
     return nMinFee;
 }
 
-bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransaction &tx, bool fLimitFree,
+bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransaction &tx, bool fLimitFree, bool fLimitDust,
                            bool* pfMissingInputs, bool fRejectAbsurdFee, int dosLevel)
 {
     if (tx.IsCoinBase())
@@ -1794,10 +1920,10 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa
         fprintf(stderr,"Cannot accept coinbase as individual tx\n");
         return state.DoS(100, error("AcceptToMemoryPool: coinbase as individual tx"),REJECT_INVALID, "coinbase");
     }
-    return AcceptToMemoryPoolInt(pool, state, tx, fLimitFree, pfMissingInputs, fRejectAbsurdFee, dosLevel);
+    return AcceptToMemoryPoolInt(pool, state, tx, fLimitFree, fLimitDust, pfMissingInputs, fRejectAbsurdFee, dosLevel);
 }
 
-bool AcceptToMemoryPoolInt(CTxMemPool& pool, CValidationState &state, const CTransaction &tx, bool fLimitFree, bool* pfMissingInputs, bool fRejectAbsurdFee, int dosLevel, int32_t simHeight, int expireThreshold)
+bool AcceptToMemoryPoolInt(CTxMemPool& pool, CValidationState &state, const CTransaction &tx, bool fLimitFree, bool fLimitDust, bool* pfMissingInputs, bool fRejectAbsurdFee, int dosLevel, int32_t simHeight, int expireThreshold)
 {
     AssertLockHeld(cs_main);
     if (pfMissingInputs)
@@ -1864,7 +1990,7 @@ bool AcceptToMemoryPoolInt(CTxMemPool& pool, CValidationState &state, const CTra
 
     // Rather not work on nonstandard transactions (unless -testnet/-regtest)
     string reason;
-    if (Params().RequireStandard() && !IsStandardTx(tx, reason, chainParams, nextBlockHeight))
+    if (Params().RequireStandard() && !IsStandardTx(tx, reason, fLimitDust, chainParams, nextBlockHeight))
     {
         //
         //fprintf(stderr,"AcceptToMemoryPool reject nonstandard transaction: %s\nscriptPubKey: %s\n",reason.c_str(),tx.vout[0].scriptPubKey.ToString().c_str());
@@ -2016,7 +2142,27 @@ bool AcceptToMemoryPoolInt(CTxMemPool& pool, CValidationState &state, const CTra
             }
         }
 
-        // if this is an identity, determine the identtyFeeFactor
+        if (txDesc.IsReserveTransfer() && !txDesc.IsImport())
+        {
+            // don't enter reserve transfers that we can reject (fLimitFree is true && not import, so not checking a block) that export to a destination of this chain
+            for (auto &oneOut : tx.vout)
+            {
+                COptCCParams p;
+                CReserveTransfer rt;
+                if (oneOut.scriptPubKey.IsPayToCryptoCondition(p) &&
+                    p.IsValid() &&
+                    p.evalCode == EVAL_RESERVE_TRANSFER &&
+                    p.vData.size() &&
+                    (rt = CReserveTransfer(p.vData[0])).IsValid() &&
+                    rt.GetImportCurrency() == ASSETCHAINS_CHAINID)
+                {
+                    LogPrintf("AcceptToMemoryPool: invalid reserve transfer transaction, cannot export to current chain :\n%s\n", txDesc.ToUniValue().write(1,2).c_str());
+                    return state.DoS(0, error("AcceptToMemoryPool: invalid reserve transfer transaction, cannot export to current chain %s", hash.ToString()), REJECT_NONSTANDARD, "bad-txns-invalid-reservetransfer");
+                }
+            }
+        }
+
+        // if this is an identity, determine the identityFeeFactor
         CAmount identityFeeFactor = 0;
         if (fLimitFree && txDesc.IsValid())
         {
@@ -2145,85 +2291,69 @@ bool AcceptToMemoryPoolInt(CTxMemPool& pool, CValidationState &state, const CTra
         unsigned int nSize = entry.GetTxSize();
 
         int64_t maxFreeSizeLimit = GetArg("-limitfreerelay", 15)*1000;
-        int64_t defaultLimitRate = maxFreeSizeLimit*10;
+        int64_t defaultLimitRate = maxFreeSizeLimit * 10;
+        CAmount minFee = GetMinRelayFeeByOutputs(txDesc, tx, state, identityFeeFactor);
 
-        // Don't accept it if it can't get into a block
-        CAmount txMinFee = GetMinRelayFee(tx, nSize, defaultLimitRate != 0);
-        if (fLimitFree && nFees < txMinFee)
+        if (fLimitFree)
         {
-            //fprintf(stderr,"accept failure.5\n");
-            return state.DoS(0, error("AcceptToMemoryPool: not enough fees %s, %d < %d",hash.ToString(), nFees, txMinFee),REJECT_INSUFFICIENTFEE, "insufficient fee");
-        }
-
-        // Require that free transactions have sufficient priority to be mined in the next block.
-        CAmount minFee = identityFeeFactor * DEFAULT_TRANSACTION_FEE;
-
-        // if we have more z-outputs + t-outputs than are needed for 1 z-output and change, increase fee
-        // we make allowance for 1 z-output or t-output, 1 native z-change, one token change, and 1 blacklisted change
-        int idExtraLimit = txDesc.IsIdentityDefinition() ? ConnectedChains.ThisChain().idReferralLevels + 2 : 0;
-        if ((tx.vShieldedOutput.size() > 1 && tx.vout.size() > (3 + idExtraLimit)) || (tx.vShieldedOutput.size() > 2 && tx.vout.size() > 2) || tx.vShieldedOutput.size() > 3)
-        {
-            minFee += ((tx.vout.size() > 3 ? (tx.vShieldedOutput.size() - 1) :
-                                                (tx.vout.size() > 2 ? tx.vShieldedOutput.size() - 2 :
-                                                                        tx.vShieldedOutput.size() - 3)) *
-                            DEFAULT_TRANSACTION_FEE);
-        }
-
-        if (minFee)
-        {
-            minFee += DEFAULT_TRANSACTION_FEE;
-        }
-        else
-        {
-            minFee = ::minRelayTxFee.GetFee(nSize);
-        }
-
-        if (GetBoolArg("-relaypriority", false) && nFees < minFee && !AllowFree(view.GetPriority(tx, chainActive.Height() + 1))) {
-            fprintf(stderr,"accept failure.6\n");
-            return state.DoS(0, false, REJECT_INSUFFICIENTFEE, "insufficient priority");
-        }
-
-        // Continuously rate-limit free (really, very-low-fee) transactions
-        // This mitigates 'penny-flooding' -- sending thousands of free transactions just to
-        // be annoying or make others' transactions take longer to confirm.
-        //
-        // protect against low fee spam via imports
-        // or notarizations before mainnet, use priority, flags, or ensure that there is always
-        // sufficient fee on txes that don't have it and remove these exemptions. right now,
-        // there are some beginning and end imports that don't have fees on a launch. We can
-        // recognize those imports, exempt block 1, or consider using fees from the initial
-        // currency definition. Exports pay delayed fees back, imports allow fees to keep flowing.
-        if (!(txDesc.IsValid() && (txDesc.IsImport() || txDesc.IsExport() || txDesc.IsNotaryPrioritized())) &&
-            fLimitFree && nFees < minFee)
-        {
-            static CCriticalSection csFreeLimiter;
-            static double dFreeCount;
-            static int64_t nLastTime;
-            int64_t nNow = GetTime();
-
-            LOCK(csFreeLimiter);
-
-            // Use an exponentially decaying ~10-minute window:
-            dFreeCount *= pow(1.0 - 1.0/600.0, (double)(nNow - nLastTime));
-            nLastTime = nNow;
-
-            // -limitfreerelay unit is thousand-bytes-per-minute
-            // At default rate it would take over a month to fill 1GB
-            if ((dFreeCount + nSize) >= defaultLimitRate || nSize > maxFreeSizeLimit)
+            if (state.IsError())
             {
-                fprintf(stderr,"AcceptToMemoryPool failure.7\n");
-                return state.DoS(0, error("AcceptToMemoryPool: free transaction rejected by rate limiter"), REJECT_INSUFFICIENTFEE, "rate limited free transaction");
+                return false;
             }
-            LogPrint("mempool", "Rate limit dFreeCount: %g => %g\n", dFreeCount, dFreeCount+nSize);
-            dFreeCount += nSize;
+
+            if (GetBoolArg("-relaypriority", false) &&
+                nFees < minFee &&
+                !AllowFree(view.GetPriority(tx, chainActive.Height() + 1)))
+            {
+                fprintf(stderr,"accept failure.6\n");
+                return state.DoS(0, false, REJECT_INSUFFICIENTFEE, "insufficient priority for fee");
+            }
+
+            // Continuously rate-limit free or very-low-fee transactions
+            // This mitigates 'penny-flooding' -- sending thousands of free transactions just to
+            // be annoying or make others' transactions take longer to confirm.
+            //
+            // protect against low fee spam via imports
+            // or notarizations before mainnet, use priority, flags, or ensure that there is always
+            // sufficient fee on txes that don't have it and remove these exemptions. right now,
+            // there are some beginning and end imports that don't have fees on a launch. We can
+            // recognize those imports, exempt block 1, or consider using fees from the initial
+            // currency definition. Exports pay delayed fees back, imports allow fees to keep flowing.
+            if (!(txDesc.IsValid() && (txDesc.IsImport() || txDesc.IsExport() || txDesc.IsNotaryPrioritized())) && nFees < minFee)
+            {
+                static CCriticalSection csFreeLimiter;
+                static double dFreeCount;
+                static int64_t nLastTime;
+                int64_t nNow = GetTime();
+
+                LOCK(csFreeLimiter);
+
+                // Use an exponentially decaying ~10-minute window:
+                dFreeCount *= pow(1.0 - 1.0/600.0, (double)(nNow - nLastTime));
+                nLastTime = nNow;
+
+                // -limitfreerelay unit is thousand-bytes-per-minute
+                // At default rate it would take over a month to fill 1GB
+                if ((dFreeCount + nSize) >= defaultLimitRate || nSize > maxFreeSizeLimit)
+                {
+                    fprintf(stderr,"AcceptToMemoryPool failure.7\n");
+                    return state.DoS(0, error("AcceptToMemoryPool: free transaction rejected by rate limiter"), REJECT_INSUFFICIENTFEE, "rate limited free transaction");
+                }
+                LogPrint("mempool", "Rate limit dFreeCount: %g => %g\n", dFreeCount, dFreeCount + nSize);
+                dFreeCount += nSize;
+            }
         }
 
         // make sure this will check any normal error case and not fail with exchanges, exports/imports, identities, etc.
-        if ((!txDesc.IsValid() || !txDesc.IsHighFee()) && fRejectAbsurdFee && nFees > minFee * 10000 && nFees > nValueOut/19)
+        if (fRejectAbsurdFee &&
+            (!txDesc.IsValid() || !txDesc.IsHighFee()) &&
+            nFees > minFee * 10000 &&
+            nFees > (GetMinRelayFee(tx, nSize, defaultLimitRate != 0) * 10000) &&
+            nFees > nValueOut/19)
         {
             string errmsg = strprintf("absurdly high fees %s, %d > %d",
-                                      hash.ToString(),
-                                      nFees, ::minRelayTxFee.GetFee(nSize) * 10000);
+                                    hash.ToString(),
+                                    nFees, ::minRelayTxFee.GetFee(nSize) * 10000);
             LogPrint("mempool", errmsg.c_str());
             return state.Error("AcceptToMemoryPool: " + errmsg);
         }
@@ -2354,14 +2484,14 @@ bool GetAddressUnspent(const uint160& addressHash, int type,
     return true;
 }
 
-bool myAddtomempool(CTransaction &tx, CValidationState *pstate, int32_t simHeight, bool limitFree, bool *missinginputs)
+bool myAddtomempool(CTransaction &tx, CValidationState *pstate, int32_t simHeight, bool limitFree, bool fLimitDust, bool *missinginputs)
 {
     CValidationState state;
     if (!pstate)
         pstate = &state;
     CTransaction Ltx; bool fOverrideFees = false;
     if ( mempool.lookup(tx.GetHash(),Ltx) == 0 )
-        return(AcceptToMemoryPoolInt(mempool, *pstate, tx, limitFree, missinginputs, !fOverrideFees, -1, simHeight));
+        return(AcceptToMemoryPoolInt(mempool, *pstate, tx, limitFree, fLimitDust, missinginputs, !fOverrideFees, -1, simHeight));
     else return(true);
 }
 
@@ -2689,9 +2819,9 @@ void CheckForkWarningConditions(const CChainParams& chainParams)
     if (IsInitialBlockDownload(chainParams))
         return;
 
-    // If our best fork is no longer within 288 blocks (+/- 12 hours if no one mines it)
+    // If our best fork is no longer within 100 blocks
     // of our head, drop it
-    if (pindexBestForkTip && chainActive.Height() - pindexBestForkTip->GetHeight() >= 288)
+    if (pindexBestForkTip && chainActive.Height() - pindexBestForkTip->GetHeight() >= 100)
         pindexBestForkTip = NULL;
 
     if (pindexBestForkTip || (pindexBestInvalid && pindexBestInvalid->chainPower > (chainActive.LastTip()->chainPower + (GetBlockProof(*chainActive.LastTip()) * 6))))
@@ -3026,13 +3156,23 @@ namespace Consensus {
                                         tx.GetHash().ToString(), FormatMoney(nValueIn), FormatMoney(tx.GetValueOut()),((double)nValueIn - tx.GetValueOut())/COIN),REJECT_INVALID, "bad-txns-in-belowout");
         }
 
-        //printf("NativeValueIn: %s\nNativeValueOut: %s\n", std::to_string(nValueIn).c_str(), std::to_string(tx.GetValueOut()).c_str());
-        //printf("ReserveValueIn: %s\nGetReserveValueOut: %s\n", ReserveValueIn.ToUniValue().write(1, 2).c_str(), tx.GetReserveValueOut().ToUniValue().write(1, 2).c_str());
-
-        if (ReserveValueIn < tx.GetReserveValueOut())
+        bool outOverflow = false;
+        CCurrencyValueMap reserveValueOut;
+        try
         {
-            fprintf(stderr,"spentheight.%d reservevaluein: %s\nis less than out: %s\n", nSpendHeight,
-                    ReserveValueIn.ToUniValue().write(1, 2).c_str(), tx.GetReserveValueOut().ToUniValue().write(1, 2).c_str());
+            reserveValueOut = tx.GetReserveValueOut();
+            //printf("NativeValueIn: %s\nNativeValueOut: %s\n", std::to_string(nValueIn).c_str(), std::to_string(tx.GetValueOut()).c_str());
+            //printf("ReserveValueIn: %s\nGetReserveValueOut: %s\n", ReserveValueIn.ToUniValue().write(1, 2).c_str(), tx.GetReserveValueOut().ToUniValue().write(1, 2).c_str());
+        }
+        catch(const std::exception& e)
+        {
+            outOverflow = true;
+        }
+
+        if (outOverflow || ReserveValueIn < reserveValueOut)
+        {
+            fprintf(stderr,"overflow or spentheight.%d reservevaluein: %s\nis less than out: %s\n", nSpendHeight,
+                    ReserveValueIn.ToUniValue().write(1, 2).c_str(), reserveValueOut.ToUniValue().write(1, 2).c_str());
             UniValue jsonTx(UniValue::VOBJ);
             TxToUniv(tx, uint256(), jsonTx);
             fprintf(stderr,"%s\n", jsonTx.write(1,2).c_str());
@@ -3740,20 +3880,6 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
     int32_t futureblock;
 
     {
-        {
-            LOCK(mempool.cs);
-            // remove any potential conflicts for inputs in the mempool from auto-created transactions,
-            // such as imports or exports to prevent us from accepting the block
-            for (auto &oneTx : block.vtx)
-            {
-                std::list<CTransaction> removedTxes;
-                if (!oneTx.IsCoinBase())
-                {
-                    mempool.removeConflicts(oneTx, removedTxes);
-                }
-            }
-        }
-
         // Check it again to verify JoinSplit proofs, and in case a previous version let a bad block in
         if (!CheckBlock(&futureblock, pindex->GetHeight(), pindex, block, state, chainparams, fExpensiveChecks ? verifier : disabledVerifier, fCheckPOW, !fJustCheck, !fJustCheck) || futureblock != 0 )
         {
@@ -3792,6 +3918,7 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
 
     CCheckQueueControl<CScriptCheck> control(fExpensiveChecks && nScriptCheckThreads ? &scriptcheckqueue : NULL);
     CCurrencyDefinition newThisChain;
+    std::vector<uint256> vOrphanErase;
 
     unsigned int nSigOps = 0;
     {
@@ -3837,22 +3964,14 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         // do not connect a tip that is in conflict with an existing notarization
         if (pindex->pprev != NULL)
         {
-            int32_t prevMoMheight; uint256 notarizedhash, txid;
+            uint256 notarizedhash;
             CBlockIndex *pNotarizedIndex = nullptr;
 
             CProofRoot confirmedRoot = ConnectedChains.FinalizedChainRoot();
-            uint32_t kNotHeight = komodo_notarized_height(&prevMoMheight, &notarizedhash, &txid);
-            bool optionalPBaaSUpgrade = ConnectedChains.IsUpgradeActive(CConnectedChains::OptionalPBaaSUpgradeKey(), pindex->pprev->GetHeight());
 
-            if (confirmedRoot.IsValid() || optionalPBaaSUpgrade)
+            if (confirmedRoot.IsValid())
             {
-                if (optionalPBaaSUpgrade ||
-                    kNotHeight <= confirmedRoot.rootHeight ||
-                    !mapBlockIndex.count(notarizedhash) ||
-                    mapBlockIndex[notarizedhash]->GetAncestor(confirmedRoot.rootHeight)->GetBlockHash() != confirmedRoot.blockHash)
-                {
-                    notarizedhash = confirmedRoot.blockHash;
-                }
+                notarizedhash = confirmedRoot.blockHash;
             }
 
             if (mapBlockIndex.count(notarizedhash))
@@ -3994,10 +4113,12 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         std::set<uint160> currencyDefinitions;
         std::set<std::pair<uint160, uint160>> idDestAndExport;
         std::set<std::pair<uint160, uint160>> currencyDestAndExport;
+        std::set<CUTXORef> orphanArbs;
 
         for (unsigned int i = 0; i < block.vtx.size(); i++)
         {
             const CTransaction &tx = block.vtx[i];
+
             const uint256 txhash = tx.GetHash();
             nInputs += tx.vin.size();
             nSigOps += GetLegacySigOpCount(tx);
@@ -4006,7 +4127,12 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
                                 REJECT_INVALID, "bad-blk-sigops");
 
             // ensure transaction can clear conflicts and get into mempool
-            std::list<CTransaction> removed;
+            if (i != 0)
+            {
+                std::list<CTransaction> removedTxes;
+                mempool.removeConflicts(tx, removedTxes);
+            }
+
             bool missingInputs = false;
             bool isPosTx = block.IsVerusPOSBlock() && (i + 1) == block.vtx.size();
             if (((tx.IsCoinBase() ||
@@ -4014,7 +4140,7 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
                   chainActive.Height() >= pindex->GetHeight()) &&
                  !ContextualCheckTransaction(tx, state, chainparams, nHeight, 10)) ||
                 (!(tx.IsCoinBase() || isPosTx || chainActive.Height() >= pindex->GetHeight()) &&
-                 !AcceptToMemoryPoolInt(mempool, state, tx, false, &missingInputs, false, 10, nHeight, 0) &&
+                 !AcceptToMemoryPoolInt(mempool, state, tx, false, !ConnectedChains.IsEnhancedDustCheck(nHeight), &missingInputs, false, 10, nHeight, 0) &&
                  !(state.GetRejectReason() == "already in mempool" ||
                    state.GetRejectReason() == "already have coins") &&
                  !(state.GetRejectReason() == "staking" &&
@@ -4022,7 +4148,10 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
                    nHeight < 1800000)))
             {
                 LogPrintf("%s: ERROR: %s\nBlock %s rejected\n", __func__, state.GetRejectReason().c_str(), block.GetHash().GetHex().c_str());
-                InvalidBlockFound(pindex, state, Params());
+                if (state.GetRejectReason() != "bad-txns-invalid-reservetransfer")
+                {
+                    InvalidBlockFound(pindex, state, Params());
+                }
                 return false; // Failure reason has been set in validation state object
             }
             state = CValidationState();
@@ -4162,6 +4291,30 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
                                 break;
                             }
 
+                            case EVAL_CROSSCHAIN_IMPORT:
+                            {
+                                // make sure we spend all of our arbs via imports
+                                CCrossChainImport cci, sysCCI;
+                                CCrossChainExport ccx;
+                                int primaryImportOut;
+                                int32_t sysCCIOut, notarizationOut, evidenceOutStart, evidenceOutEnd;
+                                CPBaaSNotarization importNotarization;
+                                CCurrencyDefinition destSystem;
+                                std::vector<CReserveTransfer> reserveTransfers;
+                                std::vector<CTransaction> arbTxes;
+                                std::vector<CUTXORef> arbTxOuts;
+                                if ((cci = CCrossChainImport(p.vData[0])).IsValid() &&
+                                    !cci.IsSourceSystemImport() &&
+                                    (reserveTransfers = cci.GetArbitrageTransfers(tx, state, nHeight, &arbTxes, &arbTxOuts)).size())
+                                {
+                                    for (auto &oneRef : arbTxOuts)
+                                    {
+                                        orphanArbs.erase(oneRef);
+                                    }
+                                }
+                                break;
+                            }
+
                             case EVAL_RESERVE_TRANSFER:
                             {
                                 // make sure we don't export the same identity or currency to the same destination more than once in any block
@@ -4169,6 +4322,10 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
                                 CReserveTransfer rt;
                                 if ((rt = CReserveTransfer(p.vData[0])).IsValid())
                                 {
+                                    if (rt.IsArbitrageOnly())
+                                    {
+                                        orphanArbs.insert(CUTXORef(tx.GetHash(), j));
+                                    }
                                     uint160 destCurrencyID = rt.GetImportCurrency();
                                     CCurrencyDefinition destCurrency = ConnectedChains.GetCachedCurrency(destCurrencyID);
                                     CCurrencyDefinition destSystem = ConnectedChains.GetCachedCurrency(destCurrency.SystemOrGatewayID());
@@ -4249,7 +4406,7 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
                                         else if (rt.IsIdentityExport())
                                         {
                                             std::pair<uint160, uint160> checkKey({destCurrency.SystemOrGatewayID(), GetDestinationID(TransferDestinationToDestination(rt.destination))});
-                                            if (!rtxd.IsImport() && idDestAndExport.count(checkKey))
+                                            if (ConnectedChains.StrictCheckIDExport(nHeight) && !rtxd.IsImport() && idDestAndExport.count(checkKey))
                                             {
                                                 return state.DoS(10, error("%s: attempt to transfer identity definition more than once to same network", __func__), REJECT_INVALID, "bad-txns-dup-currency-export");
                                             }
@@ -4264,6 +4421,9 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
                                             }
                                         }
                                     }
+
+                                    // add this to the reserve transfer cache
+                                    reserveTransferCache.Put({tx.GetHash(), (uint32_t)j}, {block.GetHash(), CInputDescriptor(oneOut.scriptPubKey, oneOut.nValue, CTxIn(tx.GetHash(), (uint32_t)j)), rt});
                                 }
                                 break;
                             }
@@ -4284,6 +4444,17 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
                 if (!view.HaveShieldedRequirements(tx))
                     return state.DoS(100, error("ConnectBlock(): JoinSplit requirements not met"),
                                     REJECT_INVALID, "bad-txns-joinsplit-requirements-not-met");
+
+                // Which orphan pool entries must we evict?
+                for (size_t j = 0; j < tx.vin.size(); j++) {
+                    auto itByPrev = mapOrphanTransactionsByPrev.find(tx.vin[j].prevout);
+                    if (itByPrev == mapOrphanTransactionsByPrev.end()) continue;
+                    for (auto mi = itByPrev->second.begin(); mi != itByPrev->second.end(); ++mi) {
+                        const CTransaction& orphanTx = (*mi)->second.tx;
+                        const uint256& orphanHash = orphanTx.GetHash();
+                        vOrphanErase.push_back(orphanHash);
+                    }
+                }
 
                 for (size_t j = 0; j < tx.vin.size(); j++) {
 
@@ -4547,6 +4718,8 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
                                                           lastNotarization.proofRoots.find(VERUS_CHAINID)->second.rootHeight >= ConnectedChains.GetZeroViaHeight(PBAAS_TESTMODE)));
 
                                 CCurrencyValueMap gatewayDeposits;
+                                CAmount totalCurrencyOut = newNotarization.currencyState.primaryCurrencyOut;
+
                                 if (improvedMinCheck)
                                 {
                                     gatewayDeposits = CCurrencyValueMap(tempLastNotarization.currencyState.currencies,
@@ -4562,7 +4735,8 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
                                 {
                                     gatewayDeposits += originalFees;
                                 }
-                                gatewayDeposits.valueMap[cbCurID] += gatewayDepositsUsed.valueMap[cbCurID] + newNotarization.currencyState.primaryCurrencyOut;
+
+                                gatewayDeposits.valueMap[cbCurID] += gatewayDepositsUsed.valueMap[cbCurID] + totalCurrencyOut;
 
                                 LogPrint("notarization", "importedcurrency %s\nspentcurrencyout %s\nnewgatewaydeposits %s\n",
                                     importedCurrency.ToUniValue().write(1,2).c_str(),
@@ -4770,6 +4944,14 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
             vPos.push_back(std::make_pair(tx.GetHash(), pos));
             pos.nTxOffset += ::GetSerializeSize(tx, SER_DISK, CLIENT_VERSION);
         }
+
+        // we don't allow orphaned arbs
+        if (orphanArbs.size())
+        {
+            return state.DoS(10,
+                         error("ConnectBlock(): block contains orphaned arbitrage transactions"),
+                               REJECT_INVALID, "bad-arb-txes-in-block");
+        }
     }
 
     view.PushAnchor(sprout_tree);
@@ -4835,7 +5017,7 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
                   verusFeePoolVal > verusCheckVal)) ||
                 (feePool.reserveValues.IntersectingValues(intersectMap)).CanonicalMap().valueMap.size() != (feePool.reserveValues).CanonicalMap().valueMap.size())
             {
-                printf("%s: rewardfees: %ld, verusfees: %ld, feePool: %s\nfeepoolcheck: %s\n",
+                printf("%s: rewardfees: %" PRId64 ", verusfees: %" PRId64 ", feePool: %s\nfeepoolcheck: %s\n",
                         __func__,
                         rewardFees,
                         verusFees,
@@ -4874,13 +5056,24 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         }
     }
 
+    CCurrencyValueMap reserveValueOut;
+    bool outOverflow = false;
+    try
+    {
+        reserveValueOut = block.vtx[0].GetReserveValueOut();
+    }
+    catch(const std::exception& e)
+    {
+        outOverflow = true;
+    }
+
     if (ASSETCHAINS_SYMBOL[0] != 0 && pindex->GetHeight() == 1 && block.vtx[0].GetValueOut() != nativeBlockReward)
     {
-        printf("%s: block.vtx[0].GetValueOut(): %ld, nativeBlockReward: %ld\nreservevalueout: %s\nvalidextracoinbaseoutputs: %s\n",
+        printf("%s: block.vtx[0].GetValueOut(): %" PRId64 ", nativeBlockReward: %" PRId64 "\nreservevalueout: %s\nvalidextracoinbaseoutputs: %s\n",
             __func__,
             block.vtx[0].GetValueOut(),
             nativeBlockReward,
-            block.vtx[0].GetReserveValueOut().ToUniValue().write(1,2).c_str(),
+            reserveValueOut.ToUniValue().write(1,2).c_str(),
             validExtraCoinbaseOutputs.ToUniValue().write(1,2).c_str());
         return state.DoS(100, error("ConnectBlock(): coinbase for block 1 pays wrong amount (actual=%d vs correct=%d)", block.vtx[0].GetValueOut(), nativeBlockReward),
                             REJECT_INVALID, "bad-cb-amount");
@@ -4891,9 +5084,9 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         validExtraCoinbaseOutputs.valueMap[VERUS_CHAINID] += verusFees;
     }
 
-    if ( block.vtx[0].GetValueOut() > nativeBlockReward || (block.vtx[0].GetReserveValueOut() > validExtraCoinbaseOutputs) )
+    if ( block.vtx[0].GetValueOut() > nativeBlockReward || outOverflow || (block.vtx[0].GetReserveValueOut() > validExtraCoinbaseOutputs) )
     {
-        printf("%s: block.vtx[0].GetValueOut(): %ld, nativeBlockReward: %ld\nreservevalueout: %s\nvalidextracoinbaseoutputs: %s\n",
+        printf("%s: block.vtx[0].GetValueOut(): %" PRId64 ", nativeBlockReward: %" PRId64 "\nreservevalueout: %s\nvalidextracoinbaseoutputs: %s\n",
             __func__,
             block.vtx[0].GetValueOut(),
             nativeBlockReward,
@@ -4906,7 +5099,9 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
                                    block.vtx[0].GetValueOut(), nativeBlockReward),
                              REJECT_INVALID, "bad-cb-amount");
         } else if ( IS_KOMODO_NOTARY != 0 )
+        {
             fprintf(stderr,"allow nHeight.%d coinbase %.8f vs %.8f\n",(int32_t)pindex->GetHeight(),dstr(block.vtx[0].GetValueOut()),dstr(nativeBlockReward));
+        }
     }
 
     if (reserveRewardTaken.valueMap.size() &&
@@ -5058,6 +5253,16 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
 
     //FlushStateToDisk();
     komodo_connectblock(pindex,*(CBlock *)&block);
+
+    // Erase orphan transactions include or precluded by this block
+    if (vOrphanErase.size()) {
+        int nErased = 0;
+        for (uint256 &orphanHash : vOrphanErase) {
+            nErased += EraseOrphanTx(orphanHash);
+        }
+        LogPrint("mempool", "Erased %d orphan tx included or conflicted by block\n", nErased);
+    }
+
     return true;
 }
 
@@ -5247,24 +5452,14 @@ bool static DisconnectTip(CValidationState &state, const CChainParams& chainpara
 
     // do not disconnect a notarized tip
     {
-        int32_t prevMoMheight; uint256 notarizedhash,txid;
+        int32_t prevMoMheight;
+        uint256 notarizedhash;
 
         CProofRoot confirmedRoot = ConnectedChains.FinalizedChainRoot();
-        uint32_t kNotHeight = komodo_notarized_height(&prevMoMheight, &notarizedhash, &txid);
-        bool optionalPBaaSUpgrade = ConnectedChains.IsUpgradeActive(CConnectedChains::OptionalPBaaSUpgradeKey(), pindexDelete->GetHeight());
 
-        if (confirmedRoot.IsValid() ||
-            optionalPBaaSUpgrade)
+        if (confirmedRoot.IsValid())
         {
-            CBlockIndex *pAncestor;
-            if (optionalPBaaSUpgrade ||
-                kNotHeight <= confirmedRoot.rootHeight ||
-                !mapBlockIndex.count(notarizedhash) ||
-                !(pAncestor = mapBlockIndex[notarizedhash]->GetAncestor(confirmedRoot.rootHeight)) ||
-                pAncestor->GetBlockHash() != confirmedRoot.blockHash)
-            {
-                notarizedhash = confirmedRoot.blockHash;
-            }
+            notarizedhash = confirmedRoot.blockHash;
         }
 
         if ( block.GetHash() == notarizedhash )
@@ -5305,20 +5500,34 @@ bool static DisconnectTip(CValidationState &state, const CChainParams& chainpara
         {
             // ignore validation errors in resurrected transactions
             CTransaction &tx = block.vtx[i];
-            list<CTransaction> removed;
             CValidationState stateDummy;
 
-            // don't keep coinbase, staking, or invalid transactions
+            // don't keep coinbase, staking, invalid transactions, or arbitrage only transfers
             if (!(tx.IsCoinBase() || ((i == (block.vtx.size() - 1)) && block.IsVerusPOSBlock())))
             {
-                AcceptToMemoryPool(mempool, stateDummy, tx, false, NULL);
+                bool isArbitrageOnly = false;
+                for (auto &oneOut : tx.vout)
+                {
+                    COptCCParams p;
+                    CReserveTransfer rt;
+                    if (oneOut.scriptPubKey.IsPayToCryptoCondition(p) &&
+                        p.evalCode == EVAL_RESERVE_TRANSFER &&
+                        p.vData.size() &&
+                        (rt = p.vData[0]).IsValid() && rt.IsArbitrageOnly())
+                    {
+                        isArbitrageOnly = true;
+                        break;
+                    }
+                }
+                if (isArbitrageOnly)
+                {
+                    continue;
+                }
+                AcceptToMemoryPool(mempool, stateDummy, tx, true, true, NULL);
             }
-
             // if this is a staking tx, and we are on Verus Sapling with nothing at stake solution,
             // save staking tx as a possible cheat
-            if (chainparams.GetConsensus().NetworkUpgradeActive(pindexDelete->GetHeight(), Consensus::UPGRADE_SAPLING) &&
-                ASSETCHAINS_LWMAPOS && (i == (block.vtx.size() - 1)) &&
-                (block.IsVerusPOSBlock()))
+            else if (((i == (block.vtx.size() - 1)) && block.IsVerusPOSBlock()) && chainparams.GetConsensus().NetworkUpgradeActive(pindexDelete->GetHeight(), Consensus::UPGRADE_SAPLING))
             {
                 CTxHolder txh = CTxHolder(block.vtx[i], pindexDelete->GetHeight());
                 cheatList.Add(txh);
@@ -5561,12 +5770,11 @@ static bool ActivateBestChainStep(CValidationState& state, const CChainParams& c
 
     auto blkIt = mapBlockIndex.find(notarizedhash);
 
-    if (!ConnectedChains.IsUpgradeActive(CConnectedChains::OptionalPBaaSUpgradeKey(), oldHeight) &&
-        pindexFork != 0 &&
+    if (pindexFork != 0 &&
         oldHeight > notarizedht &&
         blkIt != mapBlockIndex.end() &&
         chainActive.Contains(blkIt->second) &&
-        pindexFork->GetHeight() < notarizedht )
+        pindexFork->GetHeight() < notarizedht)
     {
         LogPrintf("oldHeight.%d > notarizedht %d && pindexFork->GetHeight().%d is < notarizedht %d, so ignore it\n",(int32_t)oldHeight,notarizedht,(int32_t)pindexFork->GetHeight(),notarizedht);
         // *** DEBUG ***
@@ -6221,10 +6429,7 @@ bool CheckBlock(int32_t *futureblockp,int32_t height,CBlockIndex *pindex,const C
     if (isPBaaS)
     {
         uint256 entropyHash;
-        if ((!PBAAS_TESTMODE || block.nTime >= PBAAS_TESTFORK2_TIME))
-        {
-            entropyHash = chainActive.GetVerusEntropyHash(height);
-        }
+        entropyHash = chainActive.GetVerusEntropyHash(height);
         if (isPBaaS && block.GetBlockMMRRoot() != BlockMMView(block.GetBlockMMRTree(entropyHash)).GetRoot())
         {
             LogPrint("notarization", "%s: block.GetBlockMMRRoot(): %s\nBlockMMView(block.GetBlockMMRTree(entropyHash)).GetRoot(): %s\n",
@@ -7214,6 +7419,9 @@ bool static LoadBlockIndexDB()
     pblocktree->ReadFlag("idindex", fIdIndex);
     LogPrintf("%s: identity index %s\n", __func__, fIdIndex ? "enabled" : "disabled");
 
+    pblocktree->ReadFlag("conversionindex", fConversionIndex);
+    LogPrintf("%s: conversion index %s\n", __func__, fConversionIndex ? "enabled" : "disabled");
+
     // Check whether we have an address index
     pblocktree->ReadFlag("addressindex", fAddressIndex);
     LogPrintf("%s: address index %s\n", __func__, fAddressIndex ? "enabled" : "disabled");
@@ -7559,6 +7767,14 @@ bool RewindBlockIndex(const CChainParams& chainparams, bool& clearWitnessCaches)
 
     PruneBlockIndexCandidates();
 
+    // Ensure that pindexBestHeader points to the block index entry with the most work;
+    // setBlockIndexCandidates entries are sorted by work, highest at the end.
+    {
+        std::set<CBlockIndex*, CBlockIndexWorkComparator>::reverse_iterator it = setBlockIndexCandidates.rbegin();
+        assert(it != setBlockIndexCandidates.rend());
+        pindexBestHeader = *it;
+    }
+
     CheckBlockIndex(chainparams.GetConsensus());
 
     if (!FlushStateToDisk(state, FLUSH_STATE_ALWAYS)) {
@@ -7628,9 +7844,15 @@ bool InitBlockIndex(const CChainParams& chainparams)
     fTxIndex = GetBoolArg("-txindex", true);
     pblocktree->WriteFlag("txindex", fTxIndex);
 
-    // Use the provided setting for -txindex in the new database
+    // Use the provided setting for -idindex in the new database
     fIdIndex = GetBoolArg("-idindex", false);
     pblocktree->WriteFlag("idindex", fIdIndex);
+
+    // Use the provided setting for -conversionindex in the new database
+    /*
+    fConversionIndex = GetBoolArg("-conversionindex", false);
+    pblocktree->WriteFlag("conversionindex", fConversionIndex);
+    */
 
     // Use the provided setting for -addressindex in the new database
     fAddressIndex = true;
@@ -8211,7 +8433,7 @@ void static ProcessGetData(CNode* pfrom, const Consensus::Params& consensusParam
                             if (isInMempool) {
                                 CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
                                 ss.reserve(1000);
-                                ss << *(*mi).second;
+                                ss << *txinfo.tx;
                                 pfrom->PushMessage("tx", ss);
                                 pushed = true;
                             }
@@ -8240,6 +8462,65 @@ void static ProcessGetData(CNode* pfrom, const Consensus::Params& consensusParam
         // risk analyze) the dependencies of transactions relevant to them, without
         // having to download the entire memory pool.
         pfrom->PushMessage("notfound", vNotFound);
+    }
+}
+
+void static ProcessOrphanTx(const CChainParams& chainparams, std::set<uint256>& orphan_work_set) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+{
+    AssertLockHeld(cs_main);
+    set<NodeId> setMisbehaving;
+    bool done = false;
+    while (!done && !orphan_work_set.empty()) {
+        const uint256 orphanHash = *orphan_work_set.begin();
+        orphan_work_set.erase(orphan_work_set.begin());
+
+        auto orphan_it = mapOrphanTransactions.find(orphanHash);
+        if (orphan_it == mapOrphanTransactions.end()) continue;
+
+        const CTransaction& orphanTx = orphan_it->second.tx;
+        NodeId fromPeer = orphan_it->second.fromPeer;
+        bool fMissingInputs2 = false;
+        // Use a dummy CValidationState so someone can't setup nodes to counter-DoS based on orphan
+        // resolution (that is, feeding people an invalid transaction based on LegitTxX in order to get
+        // anyone relaying LegitTxX banned)
+        CValidationState stateDummy;
+
+        if (setMisbehaving.count(fromPeer)) continue;
+        if (AcceptToMemoryPool(mempool, stateDummy, orphanTx, true, true, &fMissingInputs2))
+        {
+            LogPrint("mempool", "   accepted orphan tx %s\n", orphanHash.ToString());
+            RelayTransaction(orphanTx);
+            for (unsigned int i = 0; i < orphanTx.vout.size(); i++) {
+                auto it_by_prev = mapOrphanTransactionsByPrev.find(COutPoint(orphanHash, i));
+                if (it_by_prev != mapOrphanTransactionsByPrev.end()) {
+                    for (const auto& elem : it_by_prev->second) {
+                        orphan_work_set.insert(elem->first);
+                    }
+                }
+            }
+            EraseOrphanTx(orphanHash);
+            done = true;
+        } else if (!fMissingInputs2) {
+            int nDos = 0;
+            if (stateDummy.IsInvalid(nDos) && nDos > 0) {
+                // Punish peer that gave us an invalid orphan tx
+                Misbehaving(fromPeer, nDos);
+                setMisbehaving.insert(fromPeer);
+                LogPrint("mempool", "   invalid orphan tx %s\n", orphanHash.ToString());
+            }
+            // Has inputs but not accepted to mempool
+            // Probably non-standard or insufficient fee
+            LogPrint("mempool", "   removed orphan tx %s\n", orphanHash.ToString());
+            // Add the wtxid of this transaction to our reject filter.
+            // Unlike upstream Bitcoin Core, we can unconditionally add
+            // these, as they are always bound to the entirety of the
+            // transaction regardless of version.
+            assert(recentRejects);
+            recentRejects->insert(WTxId(orphanTx.GetHash()).ToBytes());
+            EraseOrphanTx(orphanHash);
+            done = true;
+        }
+        mempool.check(pcoinsTip);
     }
 }
 
@@ -8280,9 +8561,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         if (nVersion == 10300)
             nVersion = 300;
 
-        if (CConstVerusSolutionVector::activationHeight.ActiveVersion(nHeight) >= CConstVerusSolutionVector::activationHeight.ACTIVATE_PBAAS ?
-                                                                                 nVersion < MIN_PBAAS_VERSION :
-                                                                                 nVersion < MIN_PEER_PROTO_VERSION)
+        if (ConnectedChains.vARRRUpdateEnabled(nHeight) ? nVersion < MIN_VARRR_VERSION : nVersion < MIN_PEER_PROTO_VERSION)
         {
             // disconnect from peers older than this proto version
             LogPrintf("peer=%d using obsolete version %i; disconnecting\n", pfrom->id, pfrom->nVersion);
@@ -8641,7 +8920,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
 
         LOCK(cs_main);
 
-        std::vector<CInv> vToFetch;
+        const uint256* best_block{nullptr};
 
         for (unsigned int nInv = 0; nInv < vInv.size(); nInv++)
         {
@@ -8652,35 +8931,17 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             bool fAlreadyHave = AlreadyHave(inv);
             LogPrint("net", "got inv: %s  %s peer=%d\n", inv.ToString(), fAlreadyHave ? "have" : "new", pfrom->id);
 
-            if (!fAlreadyHave && !fImporting && !fReindex && inv.type != MSG_BLOCK)
-                pfrom->AskFor(inv);
-
             if (inv.type == MSG_BLOCK) {
                 UpdateBlockAvailability(pfrom->GetId(), inv.hash);
                 if (!fAlreadyHave && !fImporting && !fReindex && !mapBlocksInFlight.count(inv.hash)) {
-                    // First request the headers preceding the announced block. In the normal fully-synced
-                    // case where a new block is announced that succeeds the current tip (no reorganization),
-                    // there are no such headers.
-                    // Secondly, and only when we are close to being synced, we request the announced block directly,
-                    // to avoid an extra round-trip. Note that we must *first* ask for the headers, so by the
-                    // time the block arrives, the header chain leading up to it is already validated. Not
-                    // doing this will result in the received block being rejected as an orphan in case it is
-                    // not a direct successor.
-                    pfrom->PushMessage("getheaders", chainActive.GetLocator(pindexBestHeader), inv.hash);
-                    CNodeState *nodestate = State(pfrom->GetId());
-
-                    if (chainActive.Tip()->GetBlockTime() > GetAdjustedTime() - (ConnectedChains.ThisChain().blockTime * 20) &&
-                        nodestate->nBlocksInFlight < MAX_BLOCKS_IN_TRANSIT_PER_PEER) {
-                        vToFetch.push_back(inv);
-                        // Mark block as in flight already, even though the actual "getdata" message only goes out
-                        // later (within the same cs_main lock, though).
-                        MarkBlockAsInFlight(pfrom->GetId(), inv.hash, chainparams.GetConsensus());
-                    }
-                    LogPrint("net", "getheaders (%d) %s to peer=%d\n", pindexBestHeader->GetHeight(), inv.hash.ToString(), pfrom->id);
+                    // Headers-first is the primary method of announcement on
+                    // the network. If a node fell back to sending blocks by inv,
+                    // it's probably for a re-org. The final block hash
+                    // provided should be the highest, so send a getheaders and
+                    // then fetch the blocks we need to catch up.
+                    best_block = &inv.hash;
                 }
-            }
-            else
-            {
+            } else {
                 pfrom->AddKnownWTxId(WTxId(inv.hash));
                 if (fBlocksOnly)
                     LogPrint("net", "transaction (%s) inv sent in violation of protocol peer=%d\n", inv.hash.ToString(), pfrom->id);
@@ -8694,8 +8955,10 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             }
         }
 
-        if (!vToFetch.empty())
-            pfrom->PushMessage("getdata", vToFetch);
+        if (best_block != nullptr) {
+            pfrom->PushMessage("getheaders", chainActive.GetLocator(pindexBestHeader), *best_block);
+            LogPrint("net", "getheaders (%d) %s to peer=%d\n", pindexBestHeader->GetHeight(), best_block->ToString(), pfrom->id);
+        }
     }
 
 
@@ -8821,7 +9084,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
     }
 
 
-    else if (strCommand == "tx")
+    else if (strCommand == "tx" && !IsInitialBlockDownload(chainparams))
     {
         // Stop processing the transaction early if
         // We are in blocks only mode and peer is either not whitelisted or whitelistrelay is off
@@ -8831,8 +9094,6 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             return true;
         }
 
-        vector<uint256> vWorkQueue;
-        vector<uint256> vEraseQueue;
         CTransaction tx;
         vRecv >> tx;
 
@@ -8854,11 +9115,18 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         bool isCoinBase = tx.IsCoinBase();
 
         // coinbases would be accepted to the mem pool for instant spend transactions, stop them here
-        if (!isCoinBase && !AlreadyHave(inv) && AcceptToMemoryPool(mempool, state, tx, true, &fMissingInputs))
+        if (!isCoinBase && !AlreadyHave(inv) && AcceptToMemoryPool(mempool, state, tx, true, true, &fMissingInputs))
         {
             mempool.check(pcoinsTip);
             RelayTransaction(tx);
-            vWorkQueue.push_back(inv.hash);
+            for (unsigned int i = 0; i < tx.vout.size(); i++) {
+                auto it_by_prev = mapOrphanTransactionsByPrev.find(COutPoint(txid, i));
+                if (it_by_prev != mapOrphanTransactionsByPrev.end()) {
+                    for (const auto& elem : it_by_prev->second) {
+                        pfrom->orphan_work_set.insert(elem->first);
+                    }
+                }
+            }
 
             LogPrint("mempool", "AcceptToMemoryPool: peer=%d %s: accepted %s (poolsz %u)\n",
                      pfrom->id, pfrom->cleanSubVer,
@@ -8866,58 +9134,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                      mempool.mapTx.size());
 
             // Recursively process any orphan transactions that depended on this one
-            set<NodeId> setMisbehaving;
-            for (unsigned int i = 0; i < vWorkQueue.size(); i++)
-            {
-                map<uint256, set<uint256> >::iterator itByPrev = mapOrphanTransactionsByPrev.find(vWorkQueue[i]);
-                if (itByPrev == mapOrphanTransactionsByPrev.end())
-                    continue;
-                for (set<uint256>::iterator mi = itByPrev->second.begin();
-                     mi != itByPrev->second.end();
-                     ++mi)
-                {
-                    const uint256& orphanHash = *mi;
-                    const CTransaction& orphanTx = mapOrphanTransactions[orphanHash].tx;
-                    NodeId fromPeer = mapOrphanTransactions[orphanHash].fromPeer;
-                    bool fMissingInputs2 = false;
-                    // Use a dummy CValidationState so someone can't setup nodes to counter-DoS based on orphan
-                    // resolution (that is, feeding people an invalid transaction based on LegitTxX in order to get
-                    // anyone relaying LegitTxX banned)
-                    CValidationState stateDummy;
-
-
-                    if (setMisbehaving.count(fromPeer))
-                        continue;
-                    if (AcceptToMemoryPool(mempool, stateDummy, orphanTx, true, &fMissingInputs2))
-                    {
-                        LogPrint("mempool", "   accepted orphan tx %s\n", orphanHash.ToString());
-                        RelayTransaction(orphanTx);
-                        vWorkQueue.push_back(orphanHash);
-                        vEraseQueue.push_back(orphanHash);
-                    }
-                    else if (!fMissingInputs2)
-                    {
-                        int nDos = 0;
-                        if (stateDummy.IsInvalid(nDos) && nDos > 0)
-                        {
-                            // Punish peer that gave us an invalid orphan tx
-                            Misbehaving(fromPeer, nDos);
-                            setMisbehaving.insert(fromPeer);
-                            LogPrint("mempool", "   invalid orphan tx %s\n", orphanHash.ToString());
-                        }
-                        // Has inputs but not accepted to mempool
-                        // Probably non-standard or insufficient fee/priority
-                        LogPrint("mempool", "   removed orphan tx %s\n", orphanHash.ToString());
-                        vEraseQueue.push_back(orphanHash);
-                        assert(recentRejects);
-                        recentRejects->insert(orphanHash);
-                    }
-                    mempool.check(pcoinsTip);
-                }
-            }
-
-            BOOST_FOREACH(uint256 hash, vEraseQueue)
-            EraseOrphanTx(hash);
+            ProcessOrphanTx(chainparams, pfrom->orphan_work_set);
         }
         // TODO: currently, prohibit joinsplits and shielded spends/outputs from entering mapOrphans
         else if (!isCoinBase &&
@@ -8926,14 +9143,31 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                  tx.vShieldedSpend.empty() &&
                  tx.vShieldedOutput.empty())
         {
-            // valid stake transactions end up in the orphan tx bin
-            AddOrphanTx(tx, pfrom->GetId());
+            bool fRejectedParents = false; // It may be the case that the orphan's parents have all been rejected
+            for (const CTxIn& txin : tx.vin) {
+                if (recentRejects->contains(txin.prevout.hash)) {
+                    fRejectedParents = true;
+                    break;
+                }
+            }
+            if (!fRejectedParents) {
+                for (const CTxIn& txin : tx.vin) {
+                    CInv inv(MSG_TX, txin.prevout.hash);
+                    pfrom->AddKnownTxId(inv.hash);
+                    if (!AlreadyHave(inv)) pfrom->AskFor(inv);
+                }
+                // valid stake transactions end up in the orphan tx bin
+                AddOrphanTx(tx, pfrom->GetId());
 
-            // DoS prevention: do not allow mapOrphanTransactions to grow unbounded
-            unsigned int nMaxOrphanTx = (unsigned int)std::max((int64_t)0, GetArg("-maxorphantx", DEFAULT_MAX_ORPHAN_TRANSACTIONS));
-            unsigned int nEvicted = LimitOrphanTxSize(nMaxOrphanTx);
-            if (nEvicted > 0)
-                LogPrint("mempool", "mapOrphan overflow, removed %u tx\n", nEvicted);
+                // DoS prevention: do not allow mapOrphanTransactions and
+                // mapOrphanTransactionsByPrev to grow unbounded.
+                unsigned int nMaxOrphanTx = (unsigned int)std::max((int64_t)0, GetArg("-maxorphantx", DEFAULT_MAX_ORPHAN_TRANSACTIONS));
+                unsigned int nEvicted = LimitOrphanTxSize(nMaxOrphanTx);
+                if (nEvicted > 0)
+                    LogPrint("mempool", "mapOrphan overflow, removed %u tx\n", nEvicted);
+            } else {
+                LogPrint("mempool", "not keeping orphan with rejected parents %s\n",tx.GetHash().ToString());
+            }
         } else {
             assert(recentRejects);
             recentRejects->insert(tx.GetHash());
@@ -8963,7 +9197,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             LogPrint("mempool", "%s from peer=%d %s was not accepted into the memory pool: %s\n", tx.GetHash().ToString(),
                      pfrom->id, pfrom->cleanSubVer,
                      state.GetRejectReason());
-            
+
             bool sendReject = true;
             if (state.GetRejectReason() == "bad-txns-inputs-spent" && nDoS <= 1)
             {
@@ -9023,6 +9257,18 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         if (nCount == 0) {
             // Nothing interesting. Stop asking this peers for more headers.
             return true;
+        }
+
+        // If we already know the last header in the message, then it contains
+        // no new information for us.  In this case, we do not request
+        // more headers later.  This prevents multiple chains of redundant
+        // getheader requests from running in parallel if triggered by incoming
+        // blocks while the node is still in initial headers sync.
+        //
+        // (Allow disabling optimization in case there are unexpected problems.)
+        bool hasNewHeaders = true;
+        if (GetBoolArg("-optimize-getheaders", false) && IsInitialBlockDownload(chainparams)) {
+            hasNewHeaders = (mapBlockIndex.count(headers.back().GetHash()) == 0);
         }
 
         CBlockIndex *pindexLast = NULL;
@@ -9096,7 +9342,12 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         if (pindexLast)
             UpdateBlockAvailability(pfrom->GetId(), pindexLast->GetBlockHash());
 
-        if (nCount == MAX_HEADERS_RESULTS && pindexLast) {
+        // Temporary, until we're sure the optimization works
+        if (nCount == MAX_HEADERS_RESULTS && pindexLast && !hasNewHeaders) {
+            LogPrint("net", "NO more getheaders (%d) to send to peer=%d (startheight:%d)\n", pindexLast->GetHeight(), pfrom->id, pfrom->nStartingHeight);
+        }
+
+        if (nCount == MAX_HEADERS_RESULTS && pindexLast && hasNewHeaders) {
             // Headers message had its maximum size; the peer may have more headers.
             // TODO: optimize: if pindexLast is an ancestor of chainActive.Tip or pindexBestHeader, continue
             // from there instead.
@@ -9136,7 +9387,6 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             }
         }
     }
-
 
     // This asymmetric behavior for inbound and outbound connections was introduced
     // to prevent a fingerprinting attack: an attacker can send specific fake addresses
@@ -9371,7 +9621,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         // message would be undesirable as we transmit it ourselves.
     }
 
-    else {
+    else if (!(strCommand == "tx" || strCommand == "block" || strCommand == "headers" || strCommand == "alert")) {
         // Ignore unknown commands for extensibility
         LogPrint("net", "Unknown command \"%s\" from peer=%d\n", SanitizeString(strCommand), pfrom->id);
     }
@@ -9400,8 +9650,14 @@ bool ProcessMessages(CNode* pfrom)
     if (!pfrom->vRecvGetData.empty())
         ProcessGetData(pfrom, chainparams.GetConsensus());
 
+    if (!pfrom->orphan_work_set.empty()) {
+        LOCK(cs_main);
+        ProcessOrphanTx(chainparams, pfrom->orphan_work_set);
+    }
+
     // this maintains the order of responses
     if (!pfrom->vRecvGetData.empty()) return fOk;
+    if (!pfrom->orphan_work_set.empty()) return true;
 
     std::deque<CNetMessage>::iterator it = pfrom->vRecvMsg.begin();
     while (!pfrom->fDisconnect && it != pfrom->vRecvMsg.end()) {

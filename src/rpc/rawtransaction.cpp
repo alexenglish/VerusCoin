@@ -1360,8 +1360,17 @@ UniValue sendrawtransaction(const UniValue& params, bool fHelp)
     }
 
     bool fOverrideFees = false;
+    for (auto &oneOut : tx.vout)
+    {
+        if (CCurrencyDefinition(oneOut.scriptPubKey).IsValid())
+        {
+            fOverrideFees = true;
+        }
+    }
     if (params.size() > 1)
+    {
         fOverrideFees = params[1].get_bool();
+    }
 
     CCoinsViewCache &view = *pcoinsTip;
     const CCoins* existingCoins = view.AccessCoins(hashTx);
@@ -1371,7 +1380,7 @@ UniValue sendrawtransaction(const UniValue& params, bool fHelp)
         // push to local node and sync with wallets
         CValidationState state;
         bool fMissingInputs;
-        if (!AcceptToMemoryPool(mempool, state, tx, false, &fMissingInputs, !fOverrideFees)) {
+        if (!AcceptToMemoryPool(mempool, state, tx, false, false, &fMissingInputs, !fOverrideFees)) {
             if (state.IsInvalid()) {
                 throw JSONRPCError(RPC_TRANSACTION_REJECTED, strprintf("%i: %s", state.GetRejectCode(), state.GetRejectReason()));
             } else {

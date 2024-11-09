@@ -147,7 +147,7 @@ UniValue blockheaderToJSON(const CBlockIndex* blockindex)
     result.push_back(Pair("finalsaplingroot", blockindex->hashFinalSaplingRoot.GetHex()));
     result.push_back(Pair("time", (int64_t)blockindex->nTime));
     result.push_back(Pair("nonce", blockindex->nNonce.GetHex()));
-    result.push_back(Pair("solution", HexStr(blockindex->nSolution)));
+    result.push_back(Pair("solution", HexStr(blockindex->nSolution.nSolution())));
     result.push_back(Pair("bits", strprintf("%08x", blockindex->nBits)));
     result.push_back(Pair("difficulty", GetDifficulty(blockindex)));
     result.push_back(Pair("chainwork", blockindex->chainPower.chainWork.GetHex()));
@@ -404,8 +404,7 @@ UniValue getblockcount(const UniValue& params, bool fHelp)
             + HelpExampleRpc("getblockcount", "")
         );
 
-    LOCK(cs_main);
-    return chainActive.Height();
+    return chainActive.LastTip() ? chainActive.LastTip()->GetHeight() : 0;
 }
 
 UniValue getbestblockhash(const UniValue& params, bool fHelp)

@@ -499,9 +499,9 @@ public:
     std::string operator()(const libzcash::InvalidEncoding& no) const { return {}; }
 };
 
-// Sizes of SaplingPaymentAddress and SaplingSpendingKey after
-// ConvertBits<8, 5, true>(). The calculations below take the
-// regular serialized size in bytes, convert to bits, and then
+// Sizes of SaplingPaymentAddress, SaplingExtendedFullViewingKey, and
+// SaplingExtendedSpendingKey after ConvertBits<8, 5, true>(). The calculations
+// below take the regular serialized size in bytes, convert to bits, and then
 // perform ceiling division to get the number of 5-bit clusters.
 const size_t ConvertedSaplingPaymentAddressSize = ((32 + 11) * 8 + 4) / 5;
 const size_t ConvertedSaplingExtendedFullViewingKeySize = (ZIP32_XFVK_SIZE * 8 + 4) / 5;
@@ -629,38 +629,59 @@ std::string EncodePaymentAddress(const libzcash::PaymentAddress& zaddr)
     return boost::apply_visitor(PaymentAddressEncoder(Params()), zaddr);
 }
 
-libzcash::PaymentAddress DecodePaymentAddress(const std::string& str)
+template<typename T1, typename T2, typename T3>
+T1 DecodeAny(
+    const std::string& str,
+    std::pair<CChainParams::Base58Type, size_t> sprout,
+    std::pair<CChainParams::Bech32Type, size_t> sapling)
 {
     std::vector<unsigned char> data;
     if (DecodeBase58Check(str, data)) {
-        const std::vector<unsigned char>& zaddr_prefix = Params().Base58Prefix(CChainParams::ZCPAYMENT_ADDRRESS);
-        if ((data.size() == libzcash::SerializedSproutPaymentAddressSize + zaddr_prefix.size()) &&
-            std::equal(zaddr_prefix.begin(), zaddr_prefix.end(), data.begin())) {
-            CSerializeData serialized(data.begin() + zaddr_prefix.size(), data.end());
+        const std::vector<unsigned char>& prefix = Params().Base58Prefix(sprout.first);
+        if ((data.size() == sprout.second + prefix.size()) &&
+            std::equal(prefix.begin(), prefix.end(), data.begin())) {
+            CSerializeData serialized(data.begin() + prefix.size(), data.end());
             CDataStream ss(serialized, SER_NETWORK, PROTOCOL_VERSION);
-            libzcash::SproutPaymentAddress ret;
+            T2 ret;
             ss >> ret;
+            memory_cleanse(serialized.data(), serialized.size());
+            memory_cleanse(data.data(), data.size());
             return ret;
         }
     }
+
     data.clear();
     auto bech = bech32::Decode(str);
-    if (bech.first == Params().Bech32HRP(CChainParams::SAPLING_PAYMENT_ADDRESS) &&
-        bech.second.size() == ConvertedSaplingPaymentAddressSize) {
+    if (bech.first == Params().Bech32HRP(sapling.first) &&
+        bech.second.size() == sapling.second) {
         // Bech32 decoding
         data.reserve((bech.second.size() * 5) / 8);
         if (ConvertBits<5, 8, false>([&](unsigned char c) { data.push_back(c); }, bech.second.begin(), bech.second.end())) {
             CDataStream ss(data, SER_NETWORK, PROTOCOL_VERSION);
-            libzcash::SaplingPaymentAddress ret;
+            T3 ret;
             ss >> ret;
+            memory_cleanse(data.data(), data.size());
             return ret;
         }
     }
+
+    memory_cleanse(data.data(), data.size());
     return libzcash::InvalidEncoding();
 }
 
-bool IsValidPaymentAddressString(const std::string& str, uint32_t consensusBranchId) {
-    return IsValidPaymentAddress(DecodePaymentAddress(str), consensusBranchId);
+libzcash::PaymentAddress DecodePaymentAddress(const std::string& str)
+{
+    return DecodeAny<libzcash::PaymentAddress,
+        libzcash::SproutPaymentAddress,
+        libzcash::SaplingPaymentAddress>(
+            str,
+            std::make_pair(CChainParams::ZCPAYMENT_ADDRRESS, libzcash::SerializedSproutPaymentAddressSize),
+            std::make_pair(CChainParams::SAPLING_PAYMENT_ADDRESS, ConvertedSaplingPaymentAddressSize)
+        );
+}
+
+bool IsValidPaymentAddressString(const std::string& str) {
+    return IsValidPaymentAddress(DecodePaymentAddress(str));
 }
 
 std::string EncodeViewingKey(const libzcash::ViewingKey& vk)
@@ -670,35 +691,13 @@ std::string EncodeViewingKey(const libzcash::ViewingKey& vk)
 
 libzcash::ViewingKey DecodeViewingKey(const std::string& str)
 {
-    std::vector<unsigned char> data;
-    if (DecodeBase58Check(str, data)) {
-        const std::vector<unsigned char>& vk_prefix = Params().Base58Prefix(CChainParams::ZCVIEWING_KEY);
-        if ((data.size() == libzcash::SerializedSproutViewingKeySize + vk_prefix.size()) &&
-            std::equal(vk_prefix.begin(), vk_prefix.end(), data.begin())) {
-            CSerializeData serialized(data.begin() + vk_prefix.size(), data.end());
-            CDataStream ss(serialized, SER_NETWORK, PROTOCOL_VERSION);
-            libzcash::SproutViewingKey ret;
-            ss >> ret;
-            memory_cleanse(serialized.data(), serialized.size());
-            memory_cleanse(data.data(), data.size());
-            return ret;
-        }
-    }
-    data.clear();
-    auto bechFvk = bech32::Decode(str);
-    if(bechFvk.first == Params().Bech32HRP(CChainParams::SAPLING_EXTENDED_FVK) &&
-       bechFvk.second.size() == ConvertedSaplingExtendedFullViewingKeySize) {
-        // Bech32 decoding
-        data.reserve((bechFvk.second.size() * 5) / 8);
-        if (ConvertBits<5, 8, false>([&](unsigned char c) { data.push_back(c); }, bechFvk.second.begin(), bechFvk.second.end())) {
-            CDataStream ss(data, SER_NETWORK, PROTOCOL_VERSION);
-            libzcash::SaplingExtendedFullViewingKey ret;
-            ss >> ret;
-            memory_cleanse(data.data(), data.size());
-            return ret;
-        }
-    }
-    return libzcash::InvalidEncoding();
+    return DecodeAny<libzcash::ViewingKey,
+        libzcash::SproutViewingKey,
+        libzcash::SaplingExtendedFullViewingKey>(
+            str,
+            std::make_pair(CChainParams::ZCVIEWING_KEY, libzcash::SerializedSproutViewingKeySize),
+            std::make_pair(CChainParams::SAPLING_EXTENDED_FVK, ConvertedSaplingExtendedFullViewingKeySize)
+        );
 }
 
 std::string EncodeSpendingKey(const libzcash::SpendingKey& zkey)
@@ -708,36 +707,14 @@ std::string EncodeSpendingKey(const libzcash::SpendingKey& zkey)
 
 libzcash::SpendingKey DecodeSpendingKey(const std::string& str)
 {
-    std::vector<unsigned char> data;
-    if (DecodeBase58Check(str, data)) {
-        const std::vector<unsigned char>& zkey_prefix = Params().Base58Prefix(CChainParams::ZCSPENDING_KEY);
-        if ((data.size() == libzcash::SerializedSproutSpendingKeySize + zkey_prefix.size()) &&
-            std::equal(zkey_prefix.begin(), zkey_prefix.end(), data.begin())) {
-            CSerializeData serialized(data.begin() + zkey_prefix.size(), data.end());
-            CDataStream ss(serialized, SER_NETWORK, PROTOCOL_VERSION);
-            libzcash::SproutSpendingKey ret;
-            ss >> ret;
-            memory_cleanse(serialized.data(), serialized.size());
-            memory_cleanse(data.data(), data.size());
-            return ret;
-        }
-    }
-    data.clear();
-    auto bech = bech32::Decode(str);
-    if (bech.first == Params().Bech32HRP(CChainParams::SAPLING_EXTENDED_SPEND_KEY) &&
-        bech.second.size() == ConvertedSaplingExtendedSpendingKeySize) {
-        // Bech32 decoding
-        data.reserve((bech.second.size() * 5) / 8);
-        if (ConvertBits<5, 8, false>([&](unsigned char c) { data.push_back(c); }, bech.second.begin(), bech.second.end())) {
-            CDataStream ss(data, SER_NETWORK, PROTOCOL_VERSION);
-            libzcash::SaplingExtendedSpendingKey ret;
-            ss >> ret;
-            memory_cleanse(data.data(), data.size());
-            return ret;
-        }
-    }
-    memory_cleanse(data.data(), data.size());
-    return libzcash::InvalidEncoding();
+
+    return DecodeAny<libzcash::SpendingKey,
+        libzcash::SproutSpendingKey,
+        libzcash::SaplingExtendedSpendingKey>(
+            str,
+            std::make_pair(CChainParams::ZCSPENDING_KEY, libzcash::SerializedSproutSpendingKeySize),
+            std::make_pair(CChainParams::SAPLING_EXTENDED_SPEND_KEY, ConvertedSaplingExtendedSpendingKeySize)
+        );
 }
 
 CProofRoot::CProofRoot(const UniValue &uni) :
@@ -810,6 +787,18 @@ CReserveTransfer::CReserveTransfer(const UniValue &uni) : CTokenOutput(uni), nFe
         destSystemID = GetDestinationID(DecodeDestination(uni_get_str(find_value(uni, "exportto"))));
     }
     destination = CTransferDestination(find_value(uni, "destination"));
+}
+
+CReserveTransfer::CReserveTransfer(const CScript &script) : flags(0)
+{
+    COptCCParams p;
+    if (script.IsPayToCryptoCondition(p) && p.IsValid())
+    {
+        if (p.evalCode == EVAL_RESERVE_TRANSFER && p.vData.size())
+        {
+            FromVector(p.vData[0], *this);
+        }
+    }
 }
 
 CPrincipal::CPrincipal(const UniValue &uni)
@@ -969,9 +958,21 @@ CRating::CRating(const UniValue uni) :
     }
 }
 
-std::vector<unsigned char> VectorEncodeVDXFUni(const UniValue &obj)
+std::vector<unsigned char> VectorEncodeVDXFUni(const UniValue &_obj)
 {
     CDataStream ss(PROTOCOL_VERSION, SER_DISK);
+
+    UniValue obj = _obj;
+
+    if (!obj.isObject())
+    {
+        std::string objStr = uni_get_str(obj);
+        if (IsHex(objStr))
+        {
+            return ParseHex(objStr);
+        }
+        return std::vector<unsigned char>(objStr.begin(), objStr.end());
+    }
 
     std::string serializedHex = uni_get_str(find_value(obj, "serializedhex"));
     if (!serializedHex.empty())
@@ -989,6 +990,11 @@ std::vector<unsigned char> VectorEncodeVDXFUni(const UniValue &obj)
         bool isValid = false;
         auto retVec = DecodeBase64(serializedBase64.c_str(), &isValid);
         return isValid ? retVec : std::vector<unsigned char>();
+    }
+    std::string serializedMessage = uni_get_str(find_value(obj, "message"));
+    if (!serializedMessage.empty())
+    {
+        return std::vector<unsigned char>(serializedMessage.begin(), serializedMessage.end());
     }
 
     // this should be an object with "vdxfkey" as the key and {object} as the json object to serialize
@@ -1045,7 +1051,7 @@ std::vector<unsigned char> VectorEncodeVDXFUni(const UniValue &obj)
             ss << objTypeKey;
             ss << VARINT(1);
             std::string stringVal = uni_get_str(oneValValues[k]);
-            ss << VARINT(GetSerializeSize(ss, stringVal));
+            ss << COMPACTSIZE((uint64_t)GetSerializeSize(ss, stringVal));
             ss << stringVal;
         }
         else if (objTypeKey == CVDXF_Data::DataByteVectorKey())
@@ -1053,7 +1059,7 @@ std::vector<unsigned char> VectorEncodeVDXFUni(const UniValue &obj)
             ss << objTypeKey;
             ss << VARINT(1);
             std::vector<unsigned char> byteVec = ParseHex(uni_get_str(oneValValues[k]));
-            ss << VARINT(GetSerializeSize(ss, byteVec));
+            ss << COMPACTSIZE((uint64_t)GetSerializeSize(ss, byteVec));
             ss << byteVec;
         }
         else if (objTypeKey == CVDXF_Data::DataCurrencyMapKey())
@@ -1061,7 +1067,7 @@ std::vector<unsigned char> VectorEncodeVDXFUni(const UniValue &obj)
             CCurrencyValueMap oneCurMap(oneValValues[k]);
             ss << objTypeKey;
             ss << VARINT(1);
-            ss << VARINT(GetSerializeSize(ss, oneCurMap));
+            ss << COMPACTSIZE((uint64_t)GetSerializeSize(ss, oneCurMap));
             ss << oneCurMap;
         }
         else if (objTypeKey == CVDXF_Data::DataRatingsKey())
@@ -1069,7 +1075,7 @@ std::vector<unsigned char> VectorEncodeVDXFUni(const UniValue &obj)
             CRating oneRatingObj(oneValValues[k]);
             ss << objTypeKey;
             ss << VARINT(oneRatingObj.version);
-            ss << VARINT(GetSerializeSize(ss, oneRatingObj));
+            ss << COMPACTSIZE((uint64_t)GetSerializeSize(ss, oneRatingObj));
             ss << oneRatingObj;
         }
         else if (objTypeKey == CVDXF_Data::DataTransferDestinationKey())
@@ -1077,7 +1083,7 @@ std::vector<unsigned char> VectorEncodeVDXFUni(const UniValue &obj)
             CTransferDestination oneTransferDest(oneValValues[k]);
             ss << objTypeKey;
             ss << VARINT(oneTransferDest.TypeNoFlags());
-            ss << VARINT(GetSerializeSize(ss, oneTransferDest));
+            ss << COMPACTSIZE((uint64_t)GetSerializeSize(ss, oneTransferDest));
             ss << oneTransferDest;
         }
         else if (objTypeKey == CVDXF_Data::ContentMultiMapRemoveKey())
@@ -1085,8 +1091,40 @@ std::vector<unsigned char> VectorEncodeVDXFUni(const UniValue &obj)
             CContentMultiMapRemove contentRemove(oneValValues[k]);
             ss << objTypeKey;
             ss << VARINT(contentRemove.version);
-            ss << VARINT(GetSerializeSize(ss, contentRemove));
+            ss << COMPACTSIZE((uint64_t)GetSerializeSize(ss, contentRemove));
             ss << contentRemove;
+        }
+        else if (objTypeKey == CVDXF_Data::CrossChainDataRefKey())
+        {
+            CCrossChainDataRef dataRef(oneValValues[k]);
+            ss << objTypeKey;
+            ss << VARINT((int32_t)CVDXF_Data::DEFAULT_VERSION);
+            ss << COMPACTSIZE((uint64_t)GetSerializeSize(ss, dataRef));
+            ss << dataRef;
+        }
+        else if (objTypeKey == CVDXF_Data::DataDescriptorKey())
+        {
+            CDataDescriptor descr(oneValValues[k]);
+            ss << objTypeKey;
+            ss << VARINT(descr.version);
+            ss << COMPACTSIZE((uint64_t)GetSerializeSize(ss, descr));
+            ss << descr;
+        }
+        else if (objTypeKey == CVDXF_Data::MMRDescriptorKey())
+        {
+            CMMRDescriptor descr(oneValValues[k]);
+            ss << objTypeKey;
+            ss << VARINT(descr.version);
+            ss << COMPACTSIZE((uint64_t)GetSerializeSize(ss, descr));
+            ss << descr;
+        }
+        else if (objTypeKey == CVDXF_Data::SignatureDataKey())
+        {
+            CSignatureData sigData(oneValValues[k]);
+            ss << objTypeKey;
+            ss << VARINT(sigData.version);
+            ss << COMPACTSIZE((uint64_t)GetSerializeSize(ss, sigData));
+            ss << sigData;
         }
         else
         {
@@ -1123,7 +1161,7 @@ CIdentity::CIdentity(const UniValue &uni) : CPrincipal(uni)
 
     if (nVersion >= VERSION_VAULT)
     {
-        systemID = uint160(GetDestinationID(DecodeDestination(uni_get_str(find_value(uni, "systemid")))));
+        systemID = DecodeCurrencyName(uni_get_str(find_value(uni, "systemid")));
         if (systemID.IsNull())
         {
             systemID = parent.IsNull() ? GetID() : parent;
@@ -1255,8 +1293,16 @@ CIdentity::CIdentity(const UniValue &uni) : CPrincipal(uni)
     std::string revocationStr = uni_get_str(find_value(uni, "revocationauthority"));
     std::string recoveryStr = uni_get_str(find_value(uni, "recoveryauthority"));
 
-    revocationAuthority = revocationStr == "" ? GetID() : uint160(GetDestinationID(DecodeDestination(revocationStr)));
-    recoveryAuthority = recoveryStr == "" ? GetID() : uint160(GetDestinationID(DecodeDestination(recoveryStr)));
+    CTxDestination revocationDest = DecodeDestination(revocationStr);
+    CTxDestination recoveryDest = DecodeDestination(recoveryStr);
+    if ((revocationStr != "" && revocationDest.which() != COptCCParams::ADDRTYPE_ID) ||
+        (recoveryStr != "" && recoveryDest.which() != COptCCParams::ADDRTYPE_ID))
+    {
+        nVersion = VERSION_INVALID;
+    }
+
+    revocationAuthority = revocationStr == "" ? GetID() : uint160(GetDestinationID(revocationDest));
+    recoveryAuthority = recoveryStr == "" ? GetID() : uint160(GetDestinationID(recoveryDest));
     libzcash::PaymentAddress pa = DecodePaymentAddress(uni_get_str(find_value(uni, "privateaddress")));
 
     unlockAfter = uni_get_int(find_value(uni, "timelock"));

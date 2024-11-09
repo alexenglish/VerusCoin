@@ -398,21 +398,22 @@ static bool SignStepCC(const BaseSignatureCreator& creator, const CScript& scrip
                                 id = identity;
                             }
 
-                            if (!id.IsValid() && !(id = LookupIdentity(creator, CIdentityID(destId))).IsValid())
+                            if ((!id.IsValid() && !(id = LookupIdentity(creator, CIdentityID(destId))).IsValid()) ||
+                                id.IsRevoked() ||
+                                (!idID.IsNull() && destId != idID && id.IsLocked()))
                             {
                                 destMap[destId] = dest;
                                 vCC.push_back(MakeCCcondOneSig(CKeyID(GetDestinationID(dest))));
                             }
                             else
                             {
-                                bool isLockedIdSpendOrRevoked = (id.IsRevoked() || (!idID.IsNull() && destId != idID && id.IsLocked()));
                                 for (auto oneKey : id.primaryAddresses)
                                 {
-                                    destMap[GetDestinationID(oneKey)] = isLockedIdSpendOrRevoked ? CKeyID(GetDestinationID(dest)) : oneKey;
+                                    destMap[GetDestinationID(oneKey)] = oneKey;
                                 }
-                                if (id.primaryAddresses.size() == 1 || isLockedIdSpendOrRevoked)
+                                if (id.primaryAddresses.size() == 1)
                                 {
-                                    vCC.push_back(MakeCCcondOneSig(isLockedIdSpendOrRevoked ? CKeyID(GetDestinationID(dest)) : CKeyID(GetDestinationID(id.primaryAddresses[0]))));
+                                    vCC.push_back(MakeCCcondOneSig(CKeyID(GetDestinationID(id.primaryAddresses[0]))));
                                 }
                                 else
                                 {

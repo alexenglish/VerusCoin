@@ -481,6 +481,10 @@ UniValue getmininginfo(const UniValue& params, bool fHelp)
         {
             totalChainStake = ((totalChainStake * arith_uint256(posCount)) / arith_uint256(blockCount * blockCount));
         }
+        else
+        {
+            totalChainStake = 0;
+        }
 
         if (totalChainStake > arith_uint256(INT64_MAX))
         {
@@ -519,7 +523,7 @@ UniValue getmininginfo(const UniValue& params, bool fHelp)
     }
     obj.push_back(Pair("networkhashps",    getnetworksolps(params, false)));
     obj.push_back(Pair("pooledtx",         (uint64_t)mempool.size()));
-    obj.push_back(Pair("testnet",          Params().TestnetToBeDeprecatedFieldRPC()));
+    obj.push_back(Pair("testnet",          PBAAS_TESTMODE));
     obj.push_back(Pair("chain",            Params().NetworkIDString()));
 #ifdef ENABLE_MINING
     bool mining = GetBoolArg("-gen", false);
@@ -1253,8 +1257,7 @@ UniValue getblocksubsidy(const UniValue& params, bool fHelp)
             + HelpExampleRpc("getblockubsidy", "1000")
         );
 
-    LOCK(cs_main);
-    int nHeight = (params.size()==1) ? params[0].get_int() : chainActive.Height();
+    int nHeight = (params.size()==1) ? params[0].get_int() : (chainActive.LastTip() ? chainActive.LastTip()->GetHeight() : 0);
     if (nHeight < 0)
         throw JSONRPCError(RPC_INVALID_PARAMETER, "Block height out of range");
 

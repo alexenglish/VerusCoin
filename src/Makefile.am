@@ -1,4 +1,4 @@
-# Copyright (c) 2018-2019 The Verus developers
+# Copyright (c) 2018-2023 The Verus developers
 # Copyright (c) 2017-2019 The Komodo developers
 # Copyright (c) 2016-2019 The Zcash developers
 # Copyright (c) 2013-2019 The Bitcoin Core developers
@@ -46,8 +46,6 @@ BITCOIN_INCLUDES += -I$(srcdir)/cryptoconditions/include
 BITCOIN_INCLUDES += -I$(srcdir)/cryptoconditions/src/include/falcon
 BITCOIN_INCLUDES += -I$(srcdir)/cryptoconditions/src
 BITCOIN_INCLUDES += -I$(srcdir)/cryptoconditions/src/asn
-BITCOIN_INCLUDES += -I$(srcdir)/snark
-BITCOIN_INCLUDES += -I$(srcdir)/snark/libsnark
 BITCOIN_INCLUDES += -I$(srcdir)/univalue/include
 
 LIBBITCOIN_SERVER=libbitcoin_server.a -lcurl -larchive
@@ -60,7 +58,6 @@ LIBVERUS_CRYPTO=crypto/libverus_crypto.a
 LIBVERUS_PORTABLE_CRYPTO=crypto/libverus_portable_crypto.a
 LIBSECP256K1=secp256k1/libsecp256k1.la
 LIBCRYPTOCONDITIONS=cryptoconditions/libcryptoconditions_core.la
-LIBSNARK=snark/libsnark.a
 LIBUNIVALUE=univalue/libunivalue.la
 LIBZCASH=libzcash.a
 LIBTLS=libtls.a
@@ -80,21 +77,6 @@ endif
 
 $(LIBSECP256K1): $(wildcard secp256k1/src/*) $(wildcard secp256k1/include/*)
 	$(AM_V_at)$(MAKE) $(AM_MAKEFLAGS) -C $(@D) $(@F) OPTFLAGS="-O3 -march=$(PLATFORM_VARIANT) -g "
-
-LIBSNARK_CXXFLAGS = $(AM_CXXFLAGS) $(PIC_FLAGS) -DBINARY_OUTPUT -DNO_PT_COMPRESSION=1 -fstack-protector-all
-LIBSNARK_CONFIG_FLAGS = CURVE=ALT_BN128 NO_PROCPS=1 NO_DOCS=1 STATIC=1 NO_SUPERCOP=1 FEATUREFLAGS=-DMONTGOMERY_OUTPUT NO_COPY_DEPINST=1 NO_COMPILE_LIBGTEST=1
-if HAVE_OPENMP
-LIBSNARK_CONFIG_FLAGS += MULTICORE=1
-endif
-if TARGET_DARWIN
-LIBSNARK_CONFIG_FLAGS += PLATFORM=darwin
-endif
-
-$(LIBSNARK): $(wildcard snark/src/*)
-	$(AM_V_at) CC="$(CC)" CXX="$(CXX)" AR="$(AR)" CXXFLAGS="$(LIBSNARK_CXXFLAGS)" $(MAKE) $(AM_MAKEFLAGS) -C snark/ DEPINST="$(LIBSNARK_DEPINST)" $(LIBSNARK_CONFIG_FLAGS) OPTFLAGS="$(LIBSNARK_OPTFLAGS)"
-
-libsnark-tests: $(wildcard snark/src/*)
-	$(AM_V_at) CC="$(CC)" CXX="$(CXX)" AR="$(AR)" CXXFLAGS="$(LIBSNARK_CXXFLAGS)" $(MAKE) $(AM_MAKEFLAGS) -C snark/ check DEPINST="$(LIBSNARK_DEPINST)" $(LIBSNARK_CONFIG_FLAGS) OPTFLAGS="$(LIBSNARK_OPTFLAGS)"
 
 $(LIBUNIVALUE): $(wildcard univalue/lib/*)
 	$(AM_V_at)$(MAKE) $(AM_MAKEFLAGS) -C $(@D) $(@F) OPTFLAGS="-O3 -march=$(PLATFORM_VARIANT) -g "
@@ -148,18 +130,17 @@ LIBZCASH_H = \
   zcash/IncrementalMerkleTree.hpp \
   zcash/NoteEncryption.hpp \
   zcash/Address.hpp \
+  zcash/address/sapling.hpp \
+  zcash/address/sprout.hpp \
+  zcash/address/zip32.h \
   zcash/JoinSplit.hpp \
   zcash/Note.hpp \
   zcash/prf.h \
   zcash/Proof.hpp \
-  zcash/address/sapling.hpp \
-  zcash/address/sprout.hpp \
   zcash/util.h \
-  zcash/Zcash.h \
-  zcash/address/zip32.cpp \
-  zcash/address/zip32.h
+  zcash/Zcash.h
 
-.PHONY: FORCE collate-libsnark check-symbols check-security
+.PHONY: FORCE check-symbols check-security
 # bitcoin core #
 BITCOIN_CORE_H = \
   addressindex.h \
@@ -203,10 +184,6 @@ BITCOIN_CORE_H = \
   crypto/haraka_portable.h \
   crypto/verus_clhash.h \
   crypto/verus_hash.h \
-  crypto/sph_keccak.c \
-  crypto/sph_keccak.h \
-  crypto/keccak.c \
-  crypto/keccak.h \
   deprecation.h \
   hash.h \
   httprpc.h \
@@ -285,9 +262,9 @@ BITCOIN_CORE_H = \
   utiltime.h \
   validationinterface.h \
   version.h \
+  wallet/asyncrpcoperation_common.h \
   wallet/asyncrpcoperation_mergetoaddress.h \
-  wallet/asyncrpcoperation_saplingconsolidation.h \
-  wallet/asyncrpcoperation_sweeptoaddress.h \
+  wallet/asyncrpcoperation_saplingmigration.h \
   wallet/asyncrpcoperation_sendmany.h \
   wallet/asyncrpcoperation_shieldcoinbase.h \
   wallet/crypter.h \
@@ -358,10 +335,6 @@ libbitcoin_server_a_SOURCES = \
   crypto/verus_clhash.h \
   crypto/verus_hash.h \
   crypto/verus_hash.cpp \
-  crypto/sph_keccak.c \
-  crypto/sph_keccak.h \
-  crypto/keccak.c \
-  crypto/keccak.h \
   deprecation.cpp \
   httprpc.cpp \
   httpserver.cpp \
@@ -431,8 +404,7 @@ libbitcoin_wallet_a_SOURCES = \
   zcbenchmarks.h \
   wallet/asyncrpcoperation_common.cpp \
   wallet/asyncrpcoperation_mergetoaddress.cpp \
-  wallet/asyncrpcoperation_saplingconsolidation.cpp \
-  wallet/asyncrpcoperation_sweeptoaddress.cpp \
+  wallet/asyncrpcoperation_saplingmigration.cpp \
   wallet/asyncrpcoperation_sendmany.cpp \
   wallet/asyncrpcoperation_shieldcoinbase.cpp \
   wallet/crypter.cpp \
@@ -447,7 +419,6 @@ libbitcoin_wallet_a_SOURCES = \
   wallet/wallet.cpp \
   wallet/wallet_ismine.cpp \
   wallet/walletdb.cpp \
-  zcash/address/zip32.cpp \
   $(BITCOIN_CORE_H) \
   $(LIBZCASH_H)
 
@@ -476,11 +447,7 @@ crypto_libbitcoin_crypto_a_SOURCES = \
   crypto/haraka.h \
   crypto/haraka_portable.h \
   crypto/verus_hash.h \
-  crypto/verus_hash.cpp \
-  crypto/sph_keccak.c \
-  crypto/sph_keccak.h \
-  crypto/keccak.c \
-  crypto/keccak.h
+  crypto/verus_hash.cpp 
 
 if ENABLE_MINING
 EQUIHASH_TROMP_SOURCES = \
@@ -544,10 +511,6 @@ libbitcoin_common_a_SOURCES = \
   crypto/verus_clhash.h \
   crypto/verus_hash.h \
   crypto/verus_hash.cpp \
-  crypto/sph_keccak.c \
-  crypto/sph_keccak.h \
-  crypto/keccak.c \
-  crypto/keccak.h \
   hash.cpp \
   importcoin.cpp \
   key.cpp \
@@ -627,10 +590,6 @@ verusd_CPPFLAGS = $(AM_CPPFLAGS) $(BITCOIN_INCLUDES)
 verusd_CXXFLAGS = $(AM_CXXFLAGS) $(PIE_FLAGS)
 verusd_LDFLAGS = $(RELDFLAGS) $(AM_LDFLAGS) $(LIBTOOL_APP_LDFLAGS)
 
-if TARGET_DARWIN
-verusd_LDFLAGS += -static-libgcc
-endif
-
 if TARGET_WINDOWS
 verusd_SOURCES += bitcoind-res.rc
 endif
@@ -647,7 +606,6 @@ verusd_LDADD = \
   $(LIBVERUS_PORTABLE_CRYPTO) \
   $(LIBZCASH) \
   $(LIBTLS) \
-  $(LIBSNARK) \
   $(LIBLEVELDB) \
   $(LIBMEMENV) \
   $(LIBSECP256K1) \
@@ -680,10 +638,6 @@ verus_SOURCES = bitcoin-cli.cpp
 verus_CPPFLAGS = $(AM_CPPFLAGS) $(BITCOIN_INCLUDES) $(EVENT_CFLAGS)
 verus_CXXFLAGS = $(AM_CXXFLAGS) $(PIE_FLAGS)
 verus_LDFLAGS = $(RELDFLAGS) $(AM_LDFLAGS) $(LIBTOOL_APP_LDFLAGS)
-
-if TARGET_DARWIN
-verus_LDFLAGS += -static-libgcc
-endif
 
 # wallet-utility binary #
 if ENABLE_WALLET
@@ -727,7 +681,6 @@ wallet_utility_LDADD = \
 	$(CRYPTO_LIBS) \
 	$(EVENT_LIBS) \
 	$(LIBZCASH) \
-	$(LIBSNARK) \
 	$(LIBZCASH_LIBS)\
 	$(LIBCRYPTOCONDITIONS)
 endif
@@ -751,7 +704,6 @@ verus_tx_LDADD = \
   $(LIBSECP256K1) \
   $(LIBZCASH) \
   $(LIBTLS) \
-  $(LIBSNARK) \
   $(LIBBITCOIN_CRYPTO) \
   $(LIBVERUS_CRYPTO) \
   $(LIBVERUS_PORTABLE_CRYPTO) \
@@ -766,30 +718,19 @@ libzcash_a_SOURCES = \
 	zcash/IncrementalMerkleTree.cpp \
 	zcash/NoteEncryption.cpp \
 	zcash/Address.cpp \
+	zcash/address/sapling.cpp \
+    zcash/address/sprout.cpp \
+    zcash/address/zip32.cpp \
 	zcash/JoinSplit.cpp \
 	zcash/Proof.cpp \
 	zcash/Note.cpp \
 	zcash/prf.cpp \
-	zcash/address/sapling.cpp \
-	zcash/address/sprout.cpp \
 	zcash/util.cpp \
-    zcash/address/zip32.cpp \
-	zcash/circuit/commitment.tcc \
-	zcash/circuit/gadget.tcc \
-	zcash/circuit/merkle.tcc \
-	zcash/circuit/note.tcc \
-	zcash/circuit/prfs.tcc \
-	zcash/circuit/utils.tcc
+    zcash/address/zip32.cpp
 
-libzcash_a_CPPFLAGS = -DMULTICORE -fopenmp -fPIC -DBINARY_OUTPUT -DCURVE_ALT_BN128 -DBOOST_SPIRIT_THREADSAFE -DHAVE_BUILD_INFO -D__STDC_FORMAT_MACROS $(HARDENED_CPPFLAGS) $(HARDENED_CXXFLAGS) $(HARDENED_LDFLAGS) -pipe $(SAN_LDFLAGS) -O1 -g -Wstack-protector $(SAN_CXXFLAGS) -fstack-protector-all -fPIE -fvisibility=hidden -DSTATIC $(BITCOIN_INCLUDES)
-
-#libzcash_a_CXXFLAGS = $(AM_CXXFLAGS) $(PIE_FLAGS)
-#libzcash_a_LDFLAGS = $(RELDFLAGS) $(AM_LDFLAGS) $(LIBTOOL_APP_LDFLAGS)
-#libzcash_a_CPPFLAGS = $(AM_CPPFLAGS) $(BITCOIN_INCLUDES) -DMONTGOMERY_OUTPUT
-
-libzcash_a_CXXFLAGS = $(SAN_CXXFLAGS) $(HARDENED_CXXFLAGS) -fwrapv -fno-strict-aliasing
-libzcash_a_LDFLAGS = $(SAN_LDFLAGS) $(HARDENED_LDFLAGS)
-libzcash_a_CPPFLAGS += -DMONTGOMERY_OUTPUT
+libzcash_a_CPPFLAGS = $(AM_CPPFLAGS) $(PIC_FLAGS) $(BITCOIN_INCLUDES)
+libzcash_a_CXXFLAGS = $(AM_CXXFLAGS) $(PIE_FLAGS)
+libzcash_a_LDFLAGS = $(AM_LDFLAGS)
 
 # zcashconsensus library #
 if BUILD_BITCOIN_LIBS
@@ -829,7 +770,7 @@ libtls_a_SOURCES = \
     tls/utiltls.cpp\
     tls/tlsmanager.cpp
 
-libtls_a_CPPFLAGS = -DMULTICORE -fopenmp -fPIC -DBINARY_OUTPUT -DCURVE_ALT_BN128 -DBOOST_SPIRIT_THREADSAFE -DHAVE_BUILD_INFO -D__STDC_FORMAT_MACROS $(HARDENED_CPPFLAGS) -pipe -O2 -g  -Wstack-protector -fstack-protector-all -fPIE -fvisibility=hidden -DSTATIC $(BITCOIN_INCLUDES)
+libtls_a_CPPFLAGS = -DMULTICORE -fPIC -DBINARY_OUTPUT -DCURVE_ALT_BN128 -DBOOST_SPIRIT_THREADSAFE -DHAVE_BUILD_INFO -D__STDC_FORMAT_MACROS $(HARDENED_CPPFLAGS) -pipe -O2 -g  -Wstack-protector -fstack-protector-all -fPIE -fvisibility=hidden -DSTATIC $(BITCOIN_INCLUDES)
 
 libtls_a_CXXFLAGS = $(HARDENED_CXXFLAGS) -fwrapv -fno-strict-aliasing
 
@@ -841,12 +782,11 @@ CLEANFILES = leveldb/libleveldb.a leveldb/libmemenv.a *.gcda *.gcno */*.gcno wal
 
 DISTCLEANFILES = obj/build.h
 
-EXTRA_DIST = leveldb snark
+EXTRA_DIST = leveldb
 
 clean-local:
 	-$(MAKE) -C leveldb clean
 	-$(MAKE) -C secp256k1 clean
-	-$(MAKE) -C snark clean
 	-$(MAKE) -C univalue clean
 	rm -f leveldb/*/*.gcno leveldb/helpers/memenv/*.gcno
 	-rm -f config.h

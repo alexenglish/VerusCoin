@@ -29,6 +29,7 @@ static const uint32_t PBAAS_VERSION = 1;
 static const uint32_t PBAAS_VERSION_INVALID = 0;
 
 extern const uint32_t PBAAS_PREMAINNET_ACTIVATION;
+extern const uint32_t PBAAS_LARGE_ETH_PROOF_ACTIVATION;
 extern const uint32_t PBAAS_TESTFORK_TIME;
 
 class CTransaction;
@@ -203,9 +204,11 @@ public:
         DEST_ETHNFT = 10,                   // used when defining a mapped NFT to gateway that uses an ETH compatible model
         DEST_RAW = 11,
         LAST_VALID_TYPE_NO_FLAGS = DEST_RAW,
+        FLAG_RESERVED1 = 16,
+        FLAG_RESERVED2 = 32,
         FLAG_DEST_AUX = 64,
         FLAG_DEST_GATEWAY = 128,
-        FLAG_MASK = FLAG_DEST_AUX + FLAG_DEST_GATEWAY
+        FLAG_MASK = FLAG_DEST_AUX + FLAG_DEST_GATEWAY + FLAG_RESERVED1 + FLAG_RESERVED2
     };
     uint8_t type;
     std::vector<unsigned char> destination;
@@ -230,12 +233,17 @@ public:
                          std::vector<unsigned char> Destination,
                          const uint160 &GatewayID=uint160(),
                          const uint160 &GatewayCode=uint160(),
-                         int64_t Fees=0) :
+                         int64_t Fees=0,
+                         const std::vector<std::vector<unsigned char>> &AuxDests=std::vector<std::vector<unsigned char>>()) :
                          type(Type),
                          destination(Destination),
                          gatewayID(GatewayID),
                          gatewayCode(GatewayCode),
-                         fees(Fees) {}
+                         fees(Fees),
+                         auxDests(AuxDests)
+    {
+        type |= ((auxDests.size() > 0 && auxDests[0].size() > 0) ? FLAG_DEST_AUX : 0) + (gatewayID.IsNull() ? 0 : FLAG_DEST_GATEWAY);
+    }
 
     ADD_SERIALIZE_METHODS;
 
@@ -395,6 +403,7 @@ public:
     }
 
     friend bool operator<(const CCurrencyValueMap& a, const CCurrencyValueMap& b);
+    friend bool LegacyLT(const CCurrencyValueMap& a, const CCurrencyValueMap& b);
     friend bool operator>(const CCurrencyValueMap& a, const CCurrencyValueMap& b);
     friend bool operator==(const CCurrencyValueMap& a, const CCurrencyValueMap& b);
     friend bool operator!=(const CCurrencyValueMap& a, const CCurrencyValueMap& b);
@@ -435,8 +444,6 @@ public:
 class CCurrencyDefinition
 {
 public:
-    static const int64_t DEFAULT_ID_REGISTRATION_AMOUNT = 10000000000;
-
     enum EVersion
     {
         VERSION_INVALID = 0,
@@ -455,6 +462,7 @@ public:
         IDENTITY_REGISTRATION_FEE = 10000000000,    // 100 full price to register an identity
         IDENTITY_IMPORT_FEE = 2000000,              // 0.02 in native currency to import an identity
         EXTRA_Z_OUTPUT_FEE = (TRANSACTION_TRANSFER_FEE >> 1), // 2 or more z-outputs accompanied by t-outputs on a transaction
+        DEFAULT_STORAGE_OUTPUT_FACTOR = 6,          // default multiplier times the export fee to equal the cost of 6K of storage output
         MIN_CURRENCY_LIFE = 480,                    // 8 hour minimum lifetime, which gives 8 hours of minimum billing to notarize conclusion
         DEFAULT_OUTPUT_VALUE = 0,                   // 0 VRSC default output value
         DEFAULT_ID_REFERRAL_LEVELS = 3,
@@ -463,6 +471,7 @@ public:
         MAX_RESERVE_CURRENCIES = 10,
         MIN_RESERVE_RATIO = 5000000,
         MAX_STARTUP_NODES = 5,
+        MAX_NATIVE_IDENTITY_SIZE = 512,
         DEFAULT_START_TARGET = 0x1e01e1e1,
         MAX_CURRENCY_DEFINITION_EXPORTS_PER_BLOCK = 20,
         MAX_IDENTITY_DEFINITION_EXPORTS_PER_BLOCK = 100,
@@ -788,6 +797,10 @@ public:
                 READWRITE(rewardsDecay);
                 READWRITE(halving);
                 READWRITE(eraEnd);
+            }
+            else if (ser_action.ForRead())
+            {
+                blockNotarizationModulo = BLOCK_NOTARIZATION_MODULO;
             }
         }
         else
@@ -1283,6 +1296,7 @@ public:
     }
 
     static int64_t CalculateRatioOfValue(int64_t value, int64_t ratio);
+    static int64_t CalculateRatioOfTwoValues(int64_t value1, int64_t value2);
     int64_t GetTotalPreallocation() const;
     int32_t GetTotalCarveOut() const;
 };
@@ -1670,6 +1684,9 @@ public:
                     delete state.hw_sha256D;
                     break;
                 }
+                default:
+                // No action needed for HASH_INVALID or HASH_LASTTYPE
+                break;
             }
         }
         state.hw_blake2b = nullptr;
@@ -1727,6 +1744,9 @@ public:
                 state.hw_sha256D->write(pch, size);
                 break;
             }
+            default:
+                // No action for HASH_INVALID or HASH_LASTTYPE
+            break;
         }
         return (*this);
     }
@@ -1757,6 +1777,9 @@ public:
                 result = state.hw_sha256D->GetHash();
                 break;
             }
+            default:
+                // No action for HASH_INVALID or HASH_LASTTYPE
+            break;
         }
         return result;
     }

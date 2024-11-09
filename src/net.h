@@ -413,6 +413,8 @@ public:
     // Whether a ping is requested.
     std::atomic<bool> fPingQueued;
 
+    std::set<uint256> orphan_work_set;
+
     CNode(SOCKET hSocketIn, const CAddress &addrIn, const std::string &addrNameIn = "", bool fInboundIn = false, SSL *sslIn = NULL);
     ~CNode();
 
@@ -730,7 +732,7 @@ public:
         }
     }
 
-    void CloseSocketDisconnect();
+    void CloseSocketDisconnect(bool sendShutDownSSL = true);
 
     // Denial-of-service detection/prevention
     // The idea is to detect peers that are behaving

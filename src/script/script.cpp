@@ -19,6 +19,9 @@
 
 using namespace std;
 
+extern bool fIdIndex;
+extern bool fConversionIndex;
+
 namespace {
     inline std::string ValueString(const std::vector<unsigned char>& vch)
     {
@@ -175,6 +178,8 @@ const char* GetOpName(opcodetype opcode)
     }
 }
 
+int64_t STORAGE_FEE_FACTOR;
+
 uint160 GetConditionID(uint160 cid, int32_t condition)
 {
     CHashWriter hw(SER_GETHASH, PROTOCOL_VERSION);
@@ -222,7 +227,14 @@ CTxDestination GetCompatibleAuxDestination(const CTransferDestination &transferD
             {
                 if (addressProtocol != CCurrencyDefinition::PROOF_ETHNOTARIZATION)
                 {
-                    return TransferDestinationToDestination(i == -1 ? transferDest : transferDest.GetAuxDest(i));
+                    try
+                    {
+                        return TransferDestinationToDestination(i == -1 ? transferDest : transferDest.GetAuxDest(i));
+                    }
+                    catch(...)
+                    {
+                        return CTxDestination();
+                    }
                 }
                 break;
             }
@@ -231,7 +243,14 @@ CTxDestination GetCompatibleAuxDestination(const CTransferDestination &transferD
             {
                 if (addressProtocol == CCurrencyDefinition::PROOF_ETHNOTARIZATION)
                 {
-                    return TransferDestinationToDestination(i == -1 ? transferDest : transferDest.GetAuxDest(i));
+                    try
+                    {
+                        return TransferDestinationToDestination(i == -1 ? transferDest : transferDest.GetAuxDest(i));
+                    }
+                    catch(...)
+                    {
+                        return CTxDestination();
+                    }
                 }
                 break;
             }
@@ -1094,7 +1113,14 @@ std::set<CIndexID> COptCCParams::GetIndexKeys() const
                 {
                     destinations.insert(CIndexID(CCrossChainRPCData::GetConditionID(ASSETCHAINS_CHAINID, CCurrencyDefinition::ExternalCurrencyKey())));
                 }
-                if (definition.launchSystemID == ASSETCHAINS_CHAINID)
+                if (definition.launchSystemID == ASSETCHAINS_CHAINID &&
+                    !(definition.IsToken() &&
+                      !definition.IsFractional() &&
+                      definition.nativeCurrencyID.IsValid() &&
+                      definition.GetTotalPreallocation() == 0 &&
+                      (definition.nativeCurrencyID.TypeNoFlags() == CTransferDestination::DEST_ETH ||
+                       definition.nativeCurrencyID.TypeNoFlags() == CTransferDestination::DEST_ETHNFT) &&
+                      definition.systemID != ASSETCHAINS_CHAINID))
                 {
                     destinations.insert(CIndexID(CCrossChainRPCData::GetConditionID(ASSETCHAINS_CHAINID, CCurrencyDefinition::CurrencyLaunchKey())));
                 }
@@ -1154,9 +1180,6 @@ std::set<CIndexID> COptCCParams::GetIndexKeys() const
                        notarization.IsLaunchConfirmed() &&
                        notarization.currencyState.IsLaunchClear()))))
                 {
-                    // TODO: POST HARDENING confirm that the final prelaunch notarization is coming through here to index the block one
-                    // notarization of a PBaaS chain
-
                     CPBaaSNotarization checkNotarization = notarization;
                     if (checkNotarization.SetMirror(false))
                     {
@@ -1468,15 +1491,16 @@ std::set<CIndexID> COptCCParams::GetIndexKeys() const
                 }
 
                 // if we are maintaining an ID index, add keys for primary addresses, revocation, and recovery
-                extern bool fIdIndex;
                 if (fIdIndex)
                 {
                     for (auto &oneDest : identity.primaryAddresses)
                     {
                         destinations.insert(identity.IdentityPrimaryAddressKey(oneDest));
                     }
-                    destinations.insert(identity.IdentityRecoveryKey());
-                    destinations.insert(identity.IdentityRevocationKey());
+                    destinations.insert(identity.IdentityRecoveryKey(identity.recoveryAuthority));
+                    destinations.insert(identity.IdentityRevocationKey(identity.revocationAuthority));
+                    destinations.insert(identity.IdentityParentKey(identity.parent));
+                    destinations.insert(identity.IdentitySystemKey(identity.systemID));
                 }
             }
             break;
@@ -1868,6 +1892,37 @@ CCurrencyValueMap::CCurrencyValueMap(const std::vector<uint160> &currencyIDs, co
 }
 
 bool operator<(const CCurrencyValueMap& a, const CCurrencyValueMap& b)
+{
+    // to be less than means, in this order:
+    // 1. To have fewer non-zero currencies.
+    // 2. If not fewer currencies, all present currencies must be less in a than b
+    if (!a.valueMap.size() && !b.valueMap.size())
+    {
+        return false;
+    }
+
+    bool isaltb = false;
+    std::set<uint160> checked;
+
+    // ensure that we are smaller than all those present in b
+    for (auto &oneVal : b.valueMap)
+    {
+        checked.insert(oneVal.first);
+        if (oneVal.second)
+        {
+            auto it = a.valueMap.find(oneVal.first);
+
+            // negative is less than not present, which is equivalent to 0
+            if ((it == a.valueMap.end() && oneVal.second > 0) || (it != a.valueMap.end() && it->second < oneVal.second))
+            {
+                isaltb = true;
+            }
+        }
+    }
+    return isaltb;
+}
+
+bool LegacyLT(const CCurrencyValueMap& a, const CCurrencyValueMap& b)
 {
     // to be less than means, in this order:
     // 1. To have fewer non-zero currencies.

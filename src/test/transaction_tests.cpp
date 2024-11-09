@@ -373,14 +373,15 @@ BOOST_AUTO_TEST_CASE(test_basic_joinsplit_verification)
     auto verifier = libzcash::ProofVerifier::Strict();
 
     {
-        JSDescription jsdesc(false, *pzcashParams, joinSplitPubKey, rt, inputs, outputs, 0, 0);
+        JSDescription jsdesc(*pzcashParams, joinSplitPubKey, rt, inputs, outputs, 0, 0);
         BOOST_CHECK(jsdesc.Verify(*pzcashParams, verifier, joinSplitPubKey));
 
         CDataStream ss(SER_DISK, CLIENT_VERSION);
-        ss << jsdesc;
+        auto os = WithVersion(&ss, SAPLING_TX_VERSION | 1 << 31);
+        os << jsdesc;
 
         JSDescription jsdesc_deserialized;
-        ss >> jsdesc_deserialized;
+        os >> jsdesc_deserialized;
 
         BOOST_CHECK(jsdesc_deserialized == jsdesc);
         BOOST_CHECK(jsdesc_deserialized.Verify(*pzcashParams, verifier, joinSplitPubKey));
@@ -388,13 +389,13 @@ BOOST_AUTO_TEST_CASE(test_basic_joinsplit_verification)
 
     {
         // Ensure that the balance equation is working.
-        BOOST_CHECK_THROW(JSDescription(false, *pzcashParams, joinSplitPubKey, rt, inputs, outputs, 10, 0), std::invalid_argument);
-        BOOST_CHECK_THROW(JSDescription(false, *pzcashParams, joinSplitPubKey, rt, inputs, outputs, 0, 10), std::invalid_argument);
+        BOOST_CHECK_THROW(JSDescription(*pzcashParams, joinSplitPubKey, rt, inputs, outputs, 10, 0), std::invalid_argument);
+        BOOST_CHECK_THROW(JSDescription(*pzcashParams, joinSplitPubKey, rt, inputs, outputs, 0, 10), std::invalid_argument);
     }
 
     {
         // Ensure that it won't verify if the root is changed.
-        auto test = JSDescription(false, *pzcashParams, joinSplitPubKey, rt, inputs, outputs, 0, 0);
+        auto test = JSDescription(*pzcashParams, joinSplitPubKey, rt, inputs, outputs, 0, 0);
         test.anchor = GetRandHash();
         BOOST_CHECK(!test.Verify(*pzcashParams, verifier, joinSplitPubKey));
     }
@@ -768,40 +769,40 @@ BOOST_AUTO_TEST_CASE(test_IsStandard)
     BOOST_CHECK(IsStandardTx(t, reason, chainparams));
 
     t.vout[0].nValue = 53; // dust
-    BOOST_CHECK(!IsStandardTx(t, reason, chainparams));
+    BOOST_CHECK(!IsStandardTx(t, reason, false, chainparams));
 
     t.vout[0].nValue = 2730; // not dust
-    BOOST_CHECK(IsStandardTx(t, reason, chainparams));
+    BOOST_CHECK(IsStandardTx(t, reason, false, chainparams));
 
     t.vout[0].scriptPubKey = CScript() << OP_1;
-    BOOST_CHECK(!IsStandardTx(t, reason, chainparams));
+    BOOST_CHECK(!IsStandardTx(t, reason, false, chainparams));
 
     // 80-byte TX_NULL_DATA (standard)
     t.vout[0].scriptPubKey = CScript() << OP_RETURN << ParseHex("04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef3804678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38");
-    BOOST_CHECK(IsStandardTx(t, reason, chainparams));
+    BOOST_CHECK(IsStandardTx(t, reason, false, chainparams));
 
     // 81-byte TX_NULL_DATA (non-standard)
     t.vout[0].scriptPubKey = CScript() << OP_RETURN << ParseHex("04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef3804678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef3800");
-    BOOST_CHECK(!IsStandardTx(t, reason, chainparams));
+    BOOST_CHECK(!IsStandardTx(t, reason, false, chainparams));
 
     // TX_NULL_DATA w/o PUSHDATA
     t.vout.resize(1);
     t.vout[0].scriptPubKey = CScript() << OP_RETURN;
-    BOOST_CHECK(IsStandardTx(t, reason, chainparams));
+    BOOST_CHECK(IsStandardTx(t, reason, false, chainparams));
 
     // Only one TX_NULL_DATA permitted in all cases
     t.vout.resize(2);
     t.vout[0].scriptPubKey = CScript() << OP_RETURN << ParseHex("04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38");
     t.vout[1].scriptPubKey = CScript() << OP_RETURN << ParseHex("04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38");
-    BOOST_CHECK(!IsStandardTx(t, reason, chainparams));
+    BOOST_CHECK(!IsStandardTx(t, reason, false, chainparams));
 
     t.vout[0].scriptPubKey = CScript() << OP_RETURN << ParseHex("04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38");
     t.vout[1].scriptPubKey = CScript() << OP_RETURN;
-    BOOST_CHECK(!IsStandardTx(t, reason, chainparams));
+    BOOST_CHECK(!IsStandardTx(t, reason, false, chainparams));
 
     t.vout[0].scriptPubKey = CScript() << OP_RETURN;
     t.vout[1].scriptPubKey = CScript() << OP_RETURN;
-    BOOST_CHECK(!IsStandardTx(t, reason, chainparams));
+    BOOST_CHECK(!IsStandardTx(t, reason, false, chainparams));
 }
 
 BOOST_AUTO_TEST_CASE(test_IsStandardV2)
@@ -827,33 +828,33 @@ BOOST_AUTO_TEST_CASE(test_IsStandardV2)
     string reason;
     // A v2 transaction with no JoinSplits is still standard.
     t.nVersion = 2;
-    BOOST_CHECK(IsStandardTx(t, reason, chainparams));
+    BOOST_CHECK(IsStandardTx(t, reason, false, chainparams));
 
     // ... and with one JoinSplit.
     t.vJoinSplit.push_back(JSDescription());
-    BOOST_CHECK(IsStandardTx(t, reason, chainparams));
+    BOOST_CHECK(IsStandardTx(t, reason, false, chainparams));
 
     // ... and when that JoinSplit takes from a transparent input.
     JSDescription *jsdesc = &t.vJoinSplit[0];
     jsdesc->vpub_old = 10*CENT;
     t.vout[0].nValue -= 10*CENT;
-    BOOST_CHECK(IsStandardTx(t, reason, chainparams));
+    BOOST_CHECK(IsStandardTx(t, reason, false, chainparams));
 
     // A v2 transaction with JoinSplits but no transparent inputs is standard.
     jsdesc->vpub_old = 0;
     jsdesc->vpub_new = 100*CENT;
     t.vout[0].nValue = 90*CENT;
     t.vin.resize(0);
-    BOOST_CHECK(IsStandardTx(t, reason, chainparams));
+    BOOST_CHECK(IsStandardTx(t, reason, false, chainparams));
 
     // v2 transactions can still be non-standard for the same reasons as v1.
     t.vout[0].nValue = 53; // dust
-    BOOST_CHECK(!IsStandardTx(t, reason, chainparams));
+    BOOST_CHECK(!IsStandardTx(t, reason, false, chainparams));
 
     // v3 is not standard.
     t.nVersion = 3;
     t.vout[0].nValue = 90*CENT;
-    BOOST_CHECK(!IsStandardTx(t, reason, chainparams));
+    BOOST_CHECK(!IsStandardTx(t, reason, false, chainparams));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

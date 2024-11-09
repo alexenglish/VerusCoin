@@ -464,7 +464,7 @@ int32_t komodo_verifynotarization(char *symbol,char *dest,int32_t height,int32_t
     {
         if ( (json= cJSON_Parse(jsonstr)) != 0 )
         {
-            if ( (txjson= jobj(json,(char *)"result")) != 0 && (vouts= jarray(&n,txjson,(char *)"vout")) > 0 )
+            if ( (txjson= jobj(json,(char *)"result")) != 0 && (vouts= jarray(&n,txjson,(char *)"vout")) != nullptr )
             {
                 vout = jitem(vouts,n-1);
                 if ( 0 && ASSETCHAINS_SYMBOL[0] != 0 )
@@ -1736,7 +1736,7 @@ bool GetCoinSupply(int64_t &transparentSupply, int64_t *pzsupply, int64_t *pimma
         {
             if ( pIndex->newcoins == 0 && pIndex->zfunds == 0 )
             {
-                if ( !komodo_blockload(block, pIndex) == 0 || !GetNewCoins(pIndex->newcoins, &pIndex->zfunds, &immatureBlockAmounts, block, pIndex->maturity, pIndex->immature, curHeight) )
+                if ( komodo_blockload(block, pIndex) != 0 || !GetNewCoins(pIndex->newcoins, &pIndex->zfunds, &immatureBlockAmounts, block, pIndex->maturity, pIndex->immature, curHeight) )
                 {
                     fprintf(stderr,"error loading block.%d\n", pIndex->GetHeight());
                     return false;

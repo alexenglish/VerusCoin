@@ -17,6 +17,7 @@
 #include "main.h"
 #include "mmr.h"
 #include "net.h"
+#include "random.h"
 #include "rpc/protocol.h"
 #include "rpc/server.h"
 #include "script/script.h"
@@ -26,13 +27,14 @@
 #include "zcash/Note.hpp"
 #include "crypter.h"
 #include "coins.h"
-#include "wallet/asyncrpcoperation_saplingconsolidation.h"
-#include "wallet/asyncrpcoperation_sweeptoaddress.h"
+#include "wallet/asyncrpcoperation_saplingmigration.h"
+#include "wallet/asyncrpcoperation_sendmany.h"
 #include <zcash/address/zip32.h>
 #include "cc/StakeGuard.h"
 #include "pbaas/identity.h"
 #include "pbaas/pbaas.h"
 
+#include <algorithm>
 #include <assert.h>
 
 #include <boost/algorithm/string/replace.hpp>
@@ -112,7 +114,7 @@ public:
             CCurrencyValueMap leftover1 = m1.SubtractToZero(totalTargetValues);
             CCurrencyValueMap leftover2 = m2.SubtractToZero(totalTargetValues);
 
-            if (leftover1 < leftover2 && leftover2 < leftover1)
+            if (LegacyLT(leftover1, leftover2) && LegacyLT(leftover2, leftover1))
             {
                 if (leftover1.valueMap.size() < leftover2.valueMap.size())
                 {
@@ -123,9 +125,9 @@ public:
                     return false;
                 }
             }
-            return leftover1 < leftover2;
+            return LegacyLT(leftover1, leftover2);
         }
-        else if (m1 < m2 && m2 < m1)
+        else if (LegacyLT(m1, m2) && LegacyLT(m2, m1))
         {
             // this is used for sorting
             // what we care about most in this case is that we always give the same answer,
@@ -134,12 +136,12 @@ public:
             CCurrencyValueMap checkMap1 = m1.IntersectingValues(m2);
             CCurrencyValueMap checkMap2;
             // where they intersect, they are empty, no way to know which is less for sorting
-            if (!(checkMap2 < checkMap1))
+            if (!LegacyLT(checkMap2, checkMap1))
             {
                 return false;
             }
             checkMap2 = checkMap1 - m2.IntersectingValues(m1);
-            if (!(checkMap2 < checkMap1))
+            if (!LegacyLT(checkMap2, checkMap1))
             {
                 return false;
             }
@@ -148,7 +150,7 @@ public:
                 return true;
             }
         }
-        return m1 < m2;
+        return LegacyLT(m1, m2);
     }
 };
 
@@ -233,18 +235,15 @@ SaplingPaymentAddress CWallet::GenerateNewSaplingZKey()
     auto ivk = xsk.expsk.full_viewing_key().in_viewing_key();
     mapSaplingZKeyMetadata[ivk] = metadata;
 
-    auto addr = xsk.DefaultAddress();
-    if (!AddSaplingZKey(xsk, addr)) {
+    if (!AddSaplingZKey(xsk)) {
         throw std::runtime_error("CWallet::GenerateNewSaplingZKey(): AddSaplingZKey failed");
     }
     // return default sapling payment address.
-    return addr;
+    return xsk.DefaultAddress();
 }
 
 // Add spending key to keystore
-bool CWallet::AddSaplingZKey(
-    const libzcash::SaplingExtendedSpendingKey &sk,
-    const libzcash::SaplingPaymentAddress &defaultAddr)
+bool CWallet::AddSaplingZKey(const libzcash::SaplingExtendedSpendingKey &sk)
 {
     AssertLockHeld(cs_wallet); // mapSaplingZKeyMetadata
 
@@ -262,6 +261,21 @@ bool CWallet::AddSaplingZKey(
     }
 
     return true;
+}
+
+bool CWallet::AddSaplingFullViewingKey(const libzcash::SaplingExtendedFullViewingKey &extfvk)
+{
+    AssertLockHeld(cs_wallet);
+
+    if (!CCryptoKeyStore::AddSaplingFullViewingKey(extfvk)) {
+        return false;
+    }
+
+    if (!fFileBacked) {
+        return true;
+    }
+
+    return CWalletDB(strWalletFile).WriteSaplingExtendedFullViewingKey(extfvk);
 }
 
 // Add payment address -> incoming viewing key map entry
@@ -437,21 +451,19 @@ bool CWallet::AddCryptedSaplingSpendingKey(const libzcash::SaplingExtendedFullVi
     return false;
 }
 
-bool CWallet::LoadKeyMetadata(const CPubKey &pubkey, const CKeyMetadata &meta)
+void CWallet::LoadKeyMetadata(const CPubKey &pubkey, const CKeyMetadata &meta)
 {
     AssertLockHeld(cs_wallet); // mapKeyMetadata
     if (meta.nCreateTime && (!nTimeFirstKey || meta.nCreateTime < nTimeFirstKey))
         nTimeFirstKey = meta.nCreateTime;
 
     mapKeyMetadata[pubkey.GetID()] = meta;
-    return true;
 }
 
-bool CWallet::LoadZKeyMetadata(const SproutPaymentAddress &addr, const CKeyMetadata &meta)
+void CWallet::LoadZKeyMetadata(const SproutPaymentAddress &addr, const CKeyMetadata &meta)
 {
     AssertLockHeld(cs_wallet); // mapSproutZKeyMetadata
     mapSproutZKeyMetadata[addr] = meta;
-    return true;
 }
 
 bool CWallet::LoadCryptedKey(const CPubKey &vchPubKey, const std::vector<unsigned char> &vchCryptedSecret)
@@ -471,16 +483,20 @@ bool CWallet::LoadCryptedSaplingZKey(
      return CCryptoKeyStore::AddCryptedSaplingSpendingKey(extfvk, vchCryptedSecret);
 }
 
-bool CWallet::LoadSaplingZKeyMetadata(const libzcash::SaplingIncomingViewingKey &ivk, const CKeyMetadata &meta)
+void CWallet::LoadSaplingZKeyMetadata(const libzcash::SaplingIncomingViewingKey &ivk, const CKeyMetadata &meta)
 {
     AssertLockHeld(cs_wallet); // mapSaplingZKeyMetadata
     mapSaplingZKeyMetadata[ivk] = meta;
-    return true;
 }
 
 bool CWallet::LoadSaplingZKey(const libzcash::SaplingExtendedSpendingKey &key)
 {
     return CCryptoKeyStore::AddSaplingSpendingKey(key);
+}
+
+bool CWallet::LoadSaplingFullViewingKey(const libzcash::SaplingExtendedFullViewingKey &extfvk)
+{
+    return CCryptoKeyStore::AddSaplingFullViewingKey(extfvk);
 }
 
 bool CWallet::LoadSaplingPaymentAddress(
@@ -908,21 +924,61 @@ void CWallet::ChainTip(const CBlockIndex *pindex,
 {
     if (added) {
         ChainTipAdded(pindex, pblock, sproutTree, saplingTree);
+        // Prevent migration transactions from being created when node is syncing after launch,
+        // and also when node wakes up from suspension/hibernation and incoming blocks are old.
+        if (!IsInitialBlockDownload(Params()) &&
+            pblock->GetBlockTime() > GetAdjustedTime() - 3 * 60 * 60)
+        {
+            RunSaplingMigration(pindex->GetHeight());
+        }
     } else {
         DecrementNoteWitnesses(pindex);
         UpdateSaplingNullifierNoteMapForBlock(pblock);
     }
 }
 
+void CWallet::RunSaplingMigration(int blockHeight) {
+    if (!Params().GetConsensus().NetworkUpgradeActive(blockHeight, Consensus::UPGRADE_SAPLING)) {
+        return;
+    }
+    LOCK(cs_wallet);
+    if (!fSaplingMigrationEnabled) {
+        return;
+    }
+    // The migration transactions to be sent in a particular batch can take
+    // significant time to generate, and this time depends on the speed of the user's
+    // computer. If they were generated only after a block is seen at the target
+    // height minus 1, then this could leak information. Therefore, for target
+    // height N, implementations SHOULD start generating the transactions at around
+    // height N-5
+    if (blockHeight % 500 == 495) {
+        std::shared_ptr<AsyncRPCQueue> q = getAsyncRPCQueue();
+        std::shared_ptr<AsyncRPCOperation> lastOperation = q->getOperationForId(saplingMigrationOperationId);
+        if (lastOperation != nullptr) {
+            lastOperation->cancel();
+        }
+        pendingSaplingMigrationTxs.clear();
+        std::shared_ptr<AsyncRPCOperation> operation(new AsyncRPCOperation_saplingmigration(blockHeight + 5));
+        saplingMigrationOperationId = operation->getId();
+        q->addOperation(operation);
+    } else if (blockHeight % 500 == 499) {
+        std::shared_ptr<AsyncRPCQueue> q = getAsyncRPCQueue();
+        std::shared_ptr<AsyncRPCOperation> lastOperation = q->getOperationForId(saplingMigrationOperationId);
+        if (lastOperation != nullptr) {
+            lastOperation->cancel();
+        }
+        for (const CTransaction& transaction : pendingSaplingMigrationTxs) {
+            // Send the transaction
+            CWalletTx wtx(this, transaction);
+            CommitTransaction(wtx, boost::none);
+        }
+        pendingSaplingMigrationTxs.clear();
+    }
+}
+
 void CWallet::AddPendingSaplingMigrationTx(const CTransaction& tx) {
     LOCK(cs_wallet);
     pendingSaplingMigrationTxs.push_back(tx);
-}
-
-void CWallet::CommitAutomatedTx(const CTransaction& tx) {
-  CWalletTx wtx(this, tx);
-  CReserveKey reservekey(pwalletMain);
-  CommitTransaction(wtx, reservekey);
 }
 
 void CWallet::SetBestChain(const CBlockLocator& loc)
@@ -1668,6 +1724,127 @@ CWallet::TxItems CWallet::OrderedTxItems(std::list<CAccountingEntry>& acentries,
     return txOrdered;
 }
 
+CAmount CWallet::EligibleStakeOutputs(std::vector<COutput> &vecOutputs, std::vector<CWalletTx> &vwtx, bool extendedStake) const
+{
+    CAmount totalStakingAmount = 0;
+    std:vector<std::vector<unsigned char>> vSolutions;
+
+    LOCK2(cs_main, cs_wallet);
+    pwalletMain->AvailableCoins(vecOutputs, true, NULL, false, true, false);
+
+    int newSize = 0;
+    bool idStakingChain = ConnectedChains.ThisChain().IDStaking();
+
+    std::set<uint160> validIDs;
+    bool logFailures = LogAcceptCategory("staking") && LogAcceptCategory("verbose");
+
+    for (int i = 0; i < vecOutputs.size(); i++)
+    {
+        auto &txout = vecOutputs[i];
+        COptCCParams p;
+        txnouttype whichType = txnouttype::TX_NONSTANDARD;
+
+        if (txout.tx &&
+            txout.i < txout.tx->vout.size() &&
+            txout.tx->vout[txout.i].nValue > 0 &&
+            txout.fSpendable &&
+            (txout.nDepth >= VERUS_MIN_STAKEAGE) &&
+            ((txout.tx->vout[txout.i].scriptPubKey.IsPayToCryptoCondition(p) &&
+                extendedStake &&
+                p.IsValid() &&
+                txout.tx->vout[txout.i].scriptPubKey.IsSpendableOutputType(p)) ||
+                (!idStakingChain &&
+                !p.IsValid() &&
+                Solver(txout.tx->vout[txout.i].scriptPubKey, whichType, vSolutions) &&
+                (whichType == TX_PUBKEY || whichType == TX_PUBKEYHASH))))
+        {
+            // if this is a staking chain, don't try with anything that isn't valid
+            bool invalidOutput = false;
+            if (idStakingChain)
+            {
+                txnouttype txType;
+                std::vector<CTxDestination> addressesRet;
+                int nRequiredRet;
+                bool canSpend;
+                if (ExtractDestinations(txout.tx->vout[txout.i].scriptPubKey,
+                                        txType,
+                                        addressesRet,
+                                        nRequiredRet,
+                                        this,
+                                        nullptr,
+                                        &canSpend) &&
+                    canSpend)
+                {
+                    for (auto &oneAddr : addressesRet)
+                    {
+                        uint160 idID = GetDestinationID(oneAddr);
+                        if (oneAddr.which() == COptCCParams::ADDRTYPE_ID)
+                        {
+                            if (validIDs.count(idID))
+                            {
+                                continue;
+                            }
+                            std::pair<CIdentityMapKey, CIdentityMapValue> keyAndIdentity;
+                            if (!GetIdentity(idID, keyAndIdentity) ||
+                                keyAndIdentity.second.parent != ASSETCHAINS_CHAINID)
+                            {
+                                invalidOutput = true;
+                                break;
+                            }
+                            validIDs.insert(idID);
+                        }
+                        else if (oneAddr.which() == COptCCParams::ADDRTYPE_PK ||
+                                oneAddr.which() == COptCCParams::ADDRTYPE_PKH)
+                        {
+                            CCcontract_info CC;
+                            CCcontract_info *cp;
+                            cp = CCinit(&CC, p.evalCode);
+                            if (GetDestinationID(oneAddr) != GetDestinationID(DecodeDestination(CC.unspendableCCaddr)))
+                            {
+                                invalidOutput = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if (invalidOutput)
+            {
+                if (logFailures)
+                {
+                    printf("%s: Ineligible stake output (%s:%d)\n", __func__, txout.tx->GetHash().GetHex().c_str(), txout.i);
+                }
+                continue;
+            }
+
+            totalStakingAmount += txout.tx->vout[txout.i].nValue;
+            // if all are valid, no change, else compress
+            if (newSize != i)
+            {
+                vecOutputs[newSize] = txout;
+            }
+            newSize++;
+        }
+        else if (logFailures)
+        {
+            printf("%s: Ineligible staking output (%s:%d)\n", __func__, txout.tx->GetHash().GetHex().c_str(), txout.i);
+        }
+    }
+
+    if (newSize)
+    {
+        // no reallocations to move objects. do all at once, so we can release the wallet lock
+        vecOutputs.resize(newSize);
+        vwtx.resize(newSize);
+        for (int i = 0; i < vecOutputs.size(); i++)
+        {
+            vwtx[i] = *vecOutputs[i].tx;
+            vecOutputs[i].tx = &vwtx[i];
+        }
+    }
+    return totalStakingAmount;
+}
+
 // looks through all wallet UTXOs and checks to see if any qualify to stake the block at the current height. it always returns the qualified
 // UTXO with the smallest coin age if there is more than one, as larger coin age will win more often and is worth saving
 // each attempt consists of taking a VerusHash of the following values:
@@ -1696,111 +1873,7 @@ bool CWallet::VerusSelectStakeOutput(CBlock *pBlock, arith_uint256 &hashResult, 
     bool isPBaaS = solutionVersion >= CActivationHeight::ACTIVATE_PBAAS;
     bool extendedStake = solutionVersion >= CActivationHeight::ACTIVATE_EXTENDEDSTAKE;
 
-    {
-        LOCK2(cs_main, cs_wallet);
-        pwalletMain->AvailableCoins(vecOutputs, true, NULL, false, true, false);
-
-        int newSize = 0;
-        bool idStakingChain = ConnectedChains.ThisChain().IDStaking();
-
-        std::set<uint160> validIDs;
-
-        for (int i = 0; i < vecOutputs.size(); i++)
-        {
-            auto &txout = vecOutputs[i];
-            COptCCParams p;
-
-            if (txout.tx &&
-                txout.i < txout.tx->vout.size() &&
-                txout.tx->vout[txout.i].nValue > 0 &&
-                txout.fSpendable &&
-                (txout.nDepth >= VERUS_MIN_STAKEAGE) &&
-                ((txout.tx->vout[txout.i].scriptPubKey.IsPayToCryptoCondition(p) &&
-                  extendedStake &&
-                  p.IsValid() &&
-                  txout.tx->vout[txout.i].scriptPubKey.IsSpendableOutputType(p)) ||
-                 (!idStakingChain &&
-                  !p.IsValid() &&
-                  Solver(txout.tx->vout[txout.i].scriptPubKey, whichType, vSolutions) &&
-                  (whichType == TX_PUBKEY || whichType == TX_PUBKEYHASH))))
-            {
-                // if this is a staking chain, don't try with anything that isn't valid
-                bool invalidOutput = false;
-                if (idStakingChain)
-                {
-                    txnouttype txType;
-                    std::vector<CTxDestination> addressesRet;
-                    int nRequiredRet;
-                    bool canSpend;
-                    if (ExtractDestinations(txout.tx->vout[txout.i].scriptPubKey,
-                                            txType,
-                                            addressesRet,
-                                            nRequiredRet,
-                                            this,
-                                            nullptr,
-                                            &canSpend) &&
-                        canSpend)
-                    {
-                        for (auto &oneAddr : addressesRet)
-                        {
-                            uint160 idID = GetDestinationID(oneAddr);
-                            if (oneAddr.which() == COptCCParams::ADDRTYPE_ID)
-                            {
-                                if (validIDs.count(idID))
-                                {
-                                    continue;
-                                }
-                                std::pair<CIdentityMapKey, CIdentityMapValue> keyAndIdentity;
-                                if (!GetIdentity(idID, keyAndIdentity) ||
-                                    keyAndIdentity.second.parent != ASSETCHAINS_CHAINID)
-                                {
-                                    invalidOutput = true;
-                                    break;
-                                }
-                                validIDs.insert(idID);
-                            }
-                            else if (oneAddr.which() == COptCCParams::ADDRTYPE_PK ||
-                                    oneAddr.which() == COptCCParams::ADDRTYPE_PKH)
-                            {
-                                CCcontract_info CC;
-                                CCcontract_info *cp;
-                                cp = CCinit(&CC, p.evalCode);
-                                if (GetDestinationID(oneAddr) != GetDestinationID(DecodeDestination(CC.unspendableCCaddr)))
-                                {
-                                    invalidOutput = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                if (invalidOutput)
-                {
-                    continue;
-                }
-
-                totalStakingAmount += txout.tx->vout[txout.i].nValue;
-                // if all are valid, no change, else compress
-                if (newSize != i)
-                {
-                    vecOutputs[newSize] = txout;
-                }
-                newSize++;
-            }
-        }
-
-        if (newSize)
-        {
-            // no reallocations to move objects. do all at once, so we can release the wallet lock
-            vecOutputs.resize(newSize);
-            vwtx.resize(newSize);
-            for (int i = 0; i < vecOutputs.size(); i++)
-            {
-                vwtx[i] = *vecOutputs[i].tx;
-                vecOutputs[i].tx = &vwtx[i];
-            }
-        }
-    }
+    totalStakingAmount = EligibleStakeOutputs(vecOutputs, vwtx, extendedStake);
 
     if (totalStakingAmount)
     {
@@ -1942,7 +2015,7 @@ bool CWallet::VerusSelectStakeOutput(CBlock *pBlock, arith_uint256 &hashResult, 
                 CDataStream headerStream = CDataStream(SER_NETWORK, PROTOCOL_VERSION);
 
                 pBlock->nTime = std::max(chainActive.LastTip()->GetMedianTimePast()+1, GetAdjustedTime());
-                bool posSourceInfo = isPBaaS && (!PBAAS_TESTMODE || pBlock->nTime >= PBAAS_TESTFORK2_TIME);
+                bool posSourceInfo = isPBaaS;
 
                 // store:
                 // 1. PBaaS header for this block
@@ -2174,13 +2247,16 @@ int32_t CWallet::VerusStakeTransaction(CBlock *pBlock, CMutableTransaction &txNe
     //    << CStakeParams(pSrcIndex->GetHeight(), tipindex->GetHeight() + 1, pSrcIndex->GetBlockHash(), pk).AsVector();
     // !! DOWN TO HERE
 
-    if (USE_EXTERNAL_PUBKEY)
+    if (VERUS_NOTARYID.IsNull() || GetDestinationID(rewardDest) != GetDestinationID(VERUS_NOTARYID))
     {
-        rewardDest = CPubKey(ParseHex(NOTARY_PUBKEY));
-    }
-    else if (!VERUS_DEFAULTID.IsNull())
-    {
-        rewardDest = VERUS_DEFAULTID;
+        if (USE_EXTERNAL_PUBKEY)
+        {
+            rewardDest = CPubKey(ParseHex(NOTARY_PUBKEY));
+        }
+        else if (!VERUS_DEFAULTID.IsNull())
+        {
+            rewardDest = VERUS_DEFAULTID;
+        }
     }
 
     if (rewardDest.which() == COptCCParams::ADDRTYPE_INVALID)
@@ -2316,7 +2392,7 @@ void CWallet::UpdateSaplingNullifierNoteMapWithTx(CWalletTx& wtx) {
         }
         else {
             uint64_t position = nd.witnesses.front().position();
-            SaplingExtendedFullViewingKey extfvk = mapSaplingFullViewingKeys.at(nd.ivk);
+            auto extfvk = mapSaplingFullViewingKeys.at(nd.ivk);
             OutputDescription output = wtx.vShieldedOutput[op.n];
             auto optPlaintext = SaplingNotePlaintext::decrypt(output.encCiphertext, nd.ivk, output.ephemeralKey, output.cm);
             if (!optPlaintext) {
@@ -2716,7 +2792,7 @@ bool CWallet::AddToWalletIfInvolvingMe(const CTransaction& tx, const CBlock* pbl
                                                             make_pair(CIdentityMapKey(idID,
                                                                                         nHeight,
                                                                                         blockOrder,
-                                                                                        (canSignCanSpend.first ? CIdentityMapKey::CAN_SIGN : 0) + canSignCanSpend.second ? CIdentityMapKey::CAN_SPEND : 0),
+                                                                                        ((canSignCanSpend.first ? CIdentityMapKey::CAN_SIGN : 0) + canSignCanSpend.second) ? CIdentityMapKey::CAN_SPEND : 0),
                                                                       identity)));
 
                                 // now we have all the entries of the specified height, including those from before and the new one in the firstIDMap
@@ -3464,7 +3540,7 @@ boost::optional<uint256> CWallet::GetSproutNoteNullifier(const JSDescription &js
  */
 mapSproutNoteData_t CWallet::FindMySproutNotes(const CTransaction &tx) const
 {
-    LOCK(cs_SpendingKeyStore);
+    LOCK(cs_KeyStore);
     uint256 hash = tx.GetHash();
 
     mapSproutNoteData_t noteData;
@@ -3512,7 +3588,7 @@ mapSproutNoteData_t CWallet::FindMySproutNotes(const CTransaction &tx) const
  */
 std::pair<mapSaplingNoteData_t, SaplingIncomingViewingKeyMap> CWallet::FindMySaplingNotes(const CTransaction &tx) const
 {
-    LOCK(cs_SpendingKeyStore);
+    LOCK(cs_KeyStore);
     uint256 hash = tx.GetHash();
 
     mapSaplingNoteData_t noteData;
@@ -4061,6 +4137,8 @@ int64_t CWalletTx::GetTxTime() const
 }
 
 // GetAmounts will determine the transparent debits and credits for a given wallet tx.
+// in addition to sources that are already transparent in this wallet, it considers a Sapling source
+// and a negative value balance to be transparent debit
 void CWalletTx::GetAmounts(list<COutputEntry>& listReceived,
                            list<COutputEntry>& listSent, CAmount& nFee, string& strSentAccount, const isminefilter& filter) const
 {
@@ -4071,21 +4149,58 @@ void CWalletTx::GetAmounts(list<COutputEntry>& listReceived,
 
     // Is this tx sent/signed by me?
     CAmount nDebit = GetDebit(filter);
+    CAmount nShieldedDebit = 0;
 
     bool isFromMyTaddr = false;
 
-    for (auto &txin : vin)
+    // if the filter is just spendable, check sapling spends as well
+    if ((filter & ISMINE_SPENDABLE) && vShieldedSpend.size())
     {
-        map<uint256, CWalletTx>::const_iterator mi = pwallet->mapWallet.find(txin.prevout.hash);
-        if (mi != pwallet->mapWallet.end())
-        {
-            const CWalletTx& prev = (*mi).second;
-            if (txin.prevout.n < prev.vout.size())
+        std::set<uint256> ovks;
+        for (size_t i = 0; i < vShieldedSpend.size(); ++i) {
+            auto spend = vShieldedSpend[i];
+
+            // Fetch the note that is being spent
+            auto res = pwalletMain->mapSaplingNullifiersToNotes.find(spend.nullifier);
+            if (res == pwalletMain->mapSaplingNullifiersToNotes.end()) {
+                continue;
+            }
+
+            auto op = res->second;
+            auto wtxPrev = pwalletMain->mapWallet.at(op.hash);
+
+            auto decrypted = wtxPrev.DecryptSaplingNote(op).get();
+            auto notePt = decrypted.first;
+            auto pa = decrypted.second;
+
+            // Store the OutgoingViewingKey for recovering outputs
+            libzcash::SaplingExtendedFullViewingKey extfvk;
+            assert(pwalletMain->GetSaplingFullViewingKey(wtxPrev.mapSaplingNoteData.at(op).ivk, extfvk));
+
+            // if we have the spending key, add negative value balance to the debit value
+            if (pwalletMain->HaveSaplingSpendingKey(extfvk))
             {
-                if (::IsMine(*pwallet, prev.vout[txin.prevout.n].scriptPubKey) & filter)
+                isFromMyTaddr = true;
+                nShieldedDebit += notePt.value();
+            }
+        }
+    }
+
+    if (!isFromMyTaddr)
+    {
+        for (auto &txin : vin)
+        {
+            map<uint256, CWalletTx>::const_iterator mi = pwallet->mapWallet.find(txin.prevout.hash);
+            if (mi != pwallet->mapWallet.end())
+            {
+                const CWalletTx& prev = (*mi).second;
+                if (txin.prevout.n < prev.vout.size())
                 {
-                    isFromMyTaddr = true;
-                    break;
+                    if (::IsMine(*pwallet, prev.vout[txin.prevout.n].scriptPubKey) & filter)
+                    {
+                        isFromMyTaddr = true;
+                        break;
+                    }
                 }
             }
         }
@@ -4165,7 +4280,7 @@ void CWalletTx::GetAmounts(list<COutputEntry>& listReceived,
         // Only need to handle txouts if AT LEAST one of these is true:
         //   1) they debit from us (sent)
         //   2) the output is to us (received)
-        if (nDebit > 0)
+        if (nDebit > 0 || nShieldedDebit > 0)
         {
             // Don't report 'change' txouts
             if (!(filter & ISMINE_CHANGE) && pwallet->IsChange(txout))
@@ -4185,7 +4300,7 @@ void CWalletTx::GetAmounts(list<COutputEntry>& listReceived,
         COutputEntry output = {address, txout.nValue, (int)i};
 
         // If we are debited by the transaction, add the output as a "sent" entry
-        if (nDebit > 0)
+        if (nDebit > 0 || nShieldedDebit > 0)
             listSent.push_back(output);
 
         // If we are receiving the output, add it as a "received" entry
@@ -4288,36 +4403,6 @@ void CWallet::WitnessNoteCommitment(std::vector<uint256> commitments,
     BOOST_FOREACH(boost::optional<SproutWitness>& wit, witnesses) {
         if (wit) {
             assert(final_anchor == wit->root());
-        }
-    }
-}
-
-/**
- * Reorder the transactions based on block hieght and block index.
- * Transactions can get out of order when they are deleted and subsequently
- * re-added during intial load rescan.
- */
-
-void CWallet::ReorderWalletTransactions(std::map<std::pair<int,int>, CWalletTx*> &mapSorted, int64_t &maxOrderPos) {
-    AssertLockHeld(cs_main);
-    AssertLockHeld(cs_wallet);
-
-    int maxSortNumber = chainActive.Tip()->GetHeight() + 1;
-
-    for (map<uint256, CWalletTx>::iterator it = mapWallet.begin(); it != mapWallet.end(); ++it)
-    {
-        CWalletTx* pwtx = &(it->second);
-        maxOrderPos = max(maxOrderPos, pwtx->nOrderPos);
-
-        if (mapBlockIndex.count(pwtx->hashBlock) > 0) {
-            int wtxHeight = mapBlockIndex[pwtx->hashBlock]->GetHeight();
-            auto key = std::make_pair(wtxHeight, pwtx->nIndex);
-            mapSorted.insert(make_pair(key, pwtx));
-        }
-        else {
-            auto key = std::make_pair(maxSortNumber, 0);
-            mapSorted.insert(std::make_pair(key, pwtx));
-            maxSortNumber++;
         }
     }
 }
@@ -4441,7 +4526,7 @@ void CWallet::ReacceptWalletTransactions()
 
         CValidationState state;
         // attempt to add them, but don't set any DOS level
-        if (!::AcceptToMemoryPool(mempool, state, wtx, false, NULL, true, 0))
+        if (!::AcceptToMemoryPool(mempool, state, wtx, false, true, NULL, true, 0))
         {
             int nDoS;
             bool invalid = state.IsInvalid(nDoS);
@@ -4643,7 +4728,7 @@ CAmount CWalletTx::GetAvailableCredit(bool fUseCache, bool includeIDLocked, cons
     {
         if (!pwallet->IsSpent(hashTx, i) && vout[i].scriptPubKey.IsSpendableOutputType())
         {
-            CAmount newCredit = pwallet->GetCredit(*this, i, filter);;
+            CAmount newCredit = pwallet->GetCredit(*this, i, filter);
             if (newCredit)
             {
                 if (!includeIDLocked)
@@ -5378,7 +5463,7 @@ void CWallet::AvailableReserveCoins(vector<COutput>& vCoins, bool fOnlyConfirmed
     }
 }
 
-bool CWallet::GetAndValidateSaplingZAddress(const std::string &addressStr, libzcash::PaymentAddress &zaddress)
+bool CWallet::GetAndValidateSaplingZAddress(const std::string &addressStr, libzcash::PaymentAddress &zaddress, bool throwException)
 {
     std::string addrCopy = addressStr;
     std::vector<std::string> addressParts;
@@ -5398,12 +5483,19 @@ bool CWallet::GetAndValidateSaplingZAddress(const std::string &addressStr, libzc
                 return true;
             }
         }
-        throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid ID or ID that does not have valid z-address specified");
+        if (throwException)
+        {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid ID or ID that does not have valid z-address specified");
+        }
+        else
+        {
+            return false;
+        }
     }
 
     zaddress = DecodePaymentAddress(addrCopy);
     bool hasZSource = boost::get<libzcash::SaplingPaymentAddress>(&zaddress) != nullptr;
-    if (!hasZSource && boost::get<libzcash::SproutPaymentAddress>(&zaddress) != nullptr)
+    if (throwException && !hasZSource && boost::get<libzcash::SproutPaymentAddress>(&zaddress) != nullptr)
     {
         throw JSONRPCError(RPC_INVALID_PARAMETER, "Legacy Sprout address not supported. Use a transparent or Sapling compatible address");
     }
@@ -5463,7 +5555,7 @@ bool CloserToTarget(const CCurrencyValueMap &target, const CCurrencyValueMap &cu
 {
     CCurrencyValueMap workingTarget = target.SubtractToZero(current);
     CCurrencyValueMap candidateTarget = workingTarget.SubtractToZero(candidate);
-    if (candidateTarget < workingTarget)
+    if (LegacyLT(candidateTarget, workingTarget))
     {
         return true;
     }
@@ -5637,7 +5729,7 @@ bool CWallet::SelectCoinsMinConf(const CAmount& nTargetValue, int nConfMine, int
     vector<pair<CAmount, pair<const CWalletTx*,unsigned int> > > vValue;
     CAmount nTotalLower = 0;
 
-    random_shuffle(vCoins.begin(), vCoins.end(), GetRandInt);
+    std::shuffle(vCoins.begin(), vCoins.end(), ZcashRandomEngine());
 
     BOOST_FOREACH(const COutput &output, vCoins)
     {
@@ -5892,7 +5984,7 @@ bool CWallet::SelectReserveUTXOs(const CCurrencyValueMap& targetValues,
     std::vector<std::pair<CUTXORef, CCurrencyValueMap>> vOutputsToOptimize;
     std::vector<int> vOutputsToOptimizeIndexes;
 
-    random_shuffle(vCoins.begin(), vCoins.end(), GetRandInt);
+    std::shuffle(vCoins.begin(), vCoins.end(), ZcashRandomEngine());
 
     CCurrencyValueMap nTotalTarget = targetValues.CanonicalMap();
 
@@ -6022,7 +6114,7 @@ bool CWallet::SelectReserveUTXOs(const CCurrencyValueMap& targetValues,
         for (auto oneOut : lowerOuts)
         {
             mapCoinsRet.insert(std::make_pair(vCoins[oneOut.first].first, oneOut.second));
-            valueRet += oneOut.second;
+            valueRet += vCoins[oneOut.first].second;
         }
         nativeValueRet += valueRet.valueMap[ASSETCHAINS_CHAINID];
         valueRet.valueMap.erase(ASSETCHAINS_CHAINID);
@@ -6458,10 +6550,21 @@ bool CWallet::FundTransaction(CMutableTransaction& tx, CAmount &nFeeRet, int& nC
     return true;
 }
 
+CAmount GetMinRelayFeeForOutputs(const std::vector<SendManyRecipient> &tOutputs, const std::vector<SendManyRecipient> &zOutputs, CAmount identityFeeFactor, bool isIdentity);
 bool CWallet::CreateTransaction(const vector<CRecipient>& vecSend, CWalletTx& wtxNew, CReserveKey& reservekey, CAmount& nFeeRet,
                                 int& nChangePosRet, std::string& strFailReason, const CCoinControl* coinControl, bool sign)
 {
-    uint64_t interest2 = 0; CAmount nValue = 0; unsigned int nSubtractFeeFromAmount = 0;
+    uint64_t interest2 = 0;
+    CAmount nValue = 0;
+    unsigned int nSubtractFeeFromAmount = 0;
+
+    std::vector<SendManyRecipient> tOutputs;
+    const std::vector<SendManyRecipient> zOutputs;
+    for (auto &oneSend : vecSend)
+    {
+        tOutputs.push_back({"", oneSend.nAmount, "", oneSend.scriptPubKey});
+    }
+
     BOOST_FOREACH (const CRecipient& recipient, vecSend)
     {
         if (nValue < 0 || recipient.nAmount < 0)
@@ -6525,7 +6628,7 @@ bool CWallet::CreateTransaction(const vector<CRecipient>& vecSend, CWalletTx& wt
     {
         LOCK2(cs_main, cs_wallet);
         {
-            nFeeRet = 0;
+            nFeeRet = GetMinRelayFeeForOutputs(tOutputs, zOutputs, 0, false);
             while (true)
             {
                 //interest = 0;
@@ -6820,17 +6923,17 @@ bool CWallet::CreateTransaction(const vector<CRecipient>& vecSend, CWalletTx& wt
                         break;
                 }
 
-                CAmount nFeeNeeded = GetMinimumFee(nBytes, nTxConfirmTarget, mempool);
-                if ( nFeeNeeded < 5000 )
-                    nFeeNeeded = 5000;
-
-                // If we made it here and we aren't even able to meet the relay fee on the next pass, give up
-                // because we must be at the maximum allowed fee.
-                if (nFeeNeeded < ::minRelayTxFee.GetFee(nBytes))
+                tOutputs.clear();
+                for (auto &oneSend : txNew.vout)
                 {
-                    strFailReason = _("Transaction too large for fee policy");
-                    return false;
+                    tOutputs.push_back({"", oneSend.nValue, "", oneSend.scriptPubKey});
                 }
+                // remove two possible change addresses
+                if (tOutputs.size())
+                {
+                    tOutputs.resize(txNew.vout.size() - (txNew.vout.size() > 1 ? 2 : 1));
+                }
+                CAmount nFeeNeeded = GetMinRelayFeeForOutputs(tOutputs, zOutputs, 0, false);
 
                 if (nFeeRet >= nFeeNeeded)
                     break; // Done, enough fee included.
@@ -8269,10 +8372,10 @@ int CMerkleTx::GetBlocksToMaturity() const
     return(ut < toMaturity ? toMaturity : ut);
 }
 
-bool CMerkleTx::AcceptToMemoryPool(bool fLimitFree, bool fRejectAbsurdFee)
+bool CMerkleTx::AcceptToMemoryPool(bool fLimitFree, bool fRejectAbsurdFee, bool fLimitDust)
 {
     CValidationState state;
-    return ::AcceptToMemoryPool(mempool, state, *this, fLimitFree, NULL, fRejectAbsurdFee);
+    return ::AcceptToMemoryPool(mempool, state, *this, fLimitFree, fLimitDust, NULL, fRejectAbsurdFee);
 }
 
 /**
@@ -8407,14 +8510,8 @@ void CWallet::GetFilteredNotes(
             }
 
             // skip notes which cannot be spent
-            if (requireSpendingKey) {
-                libzcash::SaplingIncomingViewingKey ivk;
-                libzcash::SaplingExtendedFullViewingKey extfvk;
-                if (!(GetSaplingIncomingViewingKey(pa, ivk) &&
-                    GetSaplingFullViewingKey(ivk, extfvk) &&
-                    HaveSaplingSpendingKey(extfvk))) {
-                    continue;
-                }
+            if (requireSpendingKey && !HaveSpendingKeyForPaymentAddress(this)(pa)) {
+                continue;
             }
 
             // skip locked notes
@@ -8444,7 +8541,7 @@ bool PaymentAddressBelongsToWallet::operator()(const libzcash::SaplingPaymentAdd
     libzcash::SaplingIncomingViewingKey ivk;
 
     // If we have a SaplingExtendedSpendingKey in the wallet, then we will
-    // also have the corresponding SaplingFullViewingKey.
+    // also have the corresponding SaplingExtendedFullViewingKey.
     return m_wallet->GetSaplingIncomingViewingKey(zaddr, ivk) &&
         m_wallet->HaveSaplingFullViewingKey(ivk);
 }
@@ -8587,16 +8684,15 @@ KeyAddResult AddSpendingKeyToWallet::operator()(const libzcash::SproutSpendingKe
 KeyAddResult AddSpendingKeyToWallet::operator()(const libzcash::SaplingExtendedSpendingKey &sk) const {
     auto extfvk = sk.ToXFVK();
     auto ivk = extfvk.fvk.in_viewing_key();
-    auto addr = sk.DefaultAddress();
     {
         if (log){
-            LogPrint("zrpc", "Importing zaddr %s...\n", EncodePaymentAddress(addr));
+            LogPrint("zrpc", "Importing zaddr %s...\n", EncodePaymentAddress(sk.DefaultAddress()));
         }
         // Don't throw error in case a key is already there
         if (m_wallet->HaveSaplingSpendingKey(extfvk)) {
             return KeyAlreadyExists;
         } else {
-            if (!m_wallet-> AddSaplingZKey(sk, addr)) {
+            if (!m_wallet-> AddSaplingZKey(sk)) {
                 return KeyNotAdded;
             }
 

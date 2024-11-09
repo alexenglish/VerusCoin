@@ -148,6 +148,8 @@ bool CIdentity::IsInvalidMutation(const CIdentity &newIdentity, uint32_t height,
     return false;
 }
 
+LRUCache<std::pair<uint256, CIdentityID>, std::tuple<CIdentity, uint32_t, CTxIn>> CIdentity::IdentityLookupCache(6000);
+
 CIdentity CIdentity::LookupIdentity(const CIdentityID &nameID, uint32_t height, uint32_t *pHeightOut, CTxIn *pIdTxIn, bool checkMempool)
 {
     LOCK(mempool.cs);
@@ -204,6 +206,18 @@ CIdentity CIdentity::LookupIdentity(const CIdentityID &nameID, uint32_t height, 
         }
         unspentInputs.clear();
     }
+    // TODO: NEXTRELEASE - uncomment cache code
+    /* else if (height)
+    {
+        std::tuple<CIdentity, uint32_t, CTxIn> cachedIdentity;
+        if (std::get<0>(cachedIdentity = IdentityLookupCache.Get({chainActive[height > chainActive.Height() ? chainActive.Height() : height]->GetBlockHash(), nameID})).IsValid())
+        {
+            *pHeightOut = std::get<1>(cachedIdentity);
+            idTxIn = std::get<2>(cachedIdentity);
+            ret = std::get<0>(cachedIdentity);
+            return ret;
+        }
+    } */
 
     if (unspentOutputs.size() || GetAddressUnspent(keyID, CScript::P2IDX, unspentNewIDX) && GetAddressUnspent(keyID, CScript::P2PKH, unspentOutputs))
     {
@@ -294,6 +308,13 @@ CIdentity CIdentity::LookupIdentity(const CIdentityID &nameID, uint32_t height, 
             }
         }
     }
+
+    // TODO: NEXTRELEASE - uncomment cache code
+    /* if (height && !(height > chainActive.Height() && checkMempool))
+    {
+        IdentityLookupCache.Put({chainActive[height > chainActive.Height() ? chainActive.Height() : height]->GetBlockHash(), nameID}, {ret, *pHeightOut, idTxIn});
+    } */
+
     return ret;
 }
 
@@ -560,6 +581,13 @@ CIdentity::GetIdentityContentByKey(const uint160 &idID,
         retVec.push_back(oneEntry.second);
     }
     return retVec;
+}
+
+bool CIdentity::IsLocked(uint32_t height) const
+{
+    return nVersion >= VERSION_VAULT &&
+            (IsLocked() || (!ConnectedChains.IdentityLockOverride(*this, height) && unlockAfter >= height)) &&
+            !IsRevoked();
 }
 
 CIdentity CIdentity::LookupIdentity(const std::string &name, uint32_t height, uint32_t *pHeightOut, CTxIn *idTxIn)
@@ -1006,7 +1034,6 @@ bool ValidateSpendingIdentityReservation(const CTransaction &tx, int32_t outNum,
 {
     // CHECK #1 - there is only one reservation output, and there is also one identity output that matches the reservation.
     //            the identity output must come first and have from 0 to 3 referral outputs between it and the reservation.
-    int numReferrers = 0;
     int identityCount = 0;
     int reservationCount = 0;
     CIdentity newIdentity;
@@ -1613,47 +1640,51 @@ bool ValidateSpendingIdentityReservation(const CTransaction &tx, int32_t outNum,
 
         if (heightOut != 1)
         {
-            for (auto &txout : referralTx.vout)
+            if ((ConnectedChains.IsUpgrade01Active(height - 1) == 1) ||
+                checkReferrers.size() < issuingParent.IDReferralLevels())
             {
-                COptCCParams p;
-                if (txout.scriptPubKey.IsPayToCryptoCondition(p) && p.IsValid() && p.version >= p.VERSION_V3)
+                for (auto &txout : referralTx.vout)
                 {
-                    if (p.evalCode == EVAL_IDENTITY_PRIMARY)
+                    COptCCParams p;
+                    if (txout.scriptPubKey.IsPayToCryptoCondition(p) && p.IsValid() && p.version >= p.VERSION_V3)
                     {
-                        afterPrimary = true;
-                    }
-                    else if (afterPrimary &&
-                             !isReferral &&
-                             issuingParent.IDReferrals() &&
-                             issuingParent.IDReferralLevels() &&
-                             ((issuingParent.proofProtocol != issuingParent.PROOF_CHAINID && p.evalCode == EVAL_RESERVE_TRANSFER) ||
-                              (issuingParent.proofProtocol == issuingParent.PROOF_CHAINID && (p.evalCode == EVAL_RESERVE_OUTPUT || p.evalCode == EVAL_NONE))))
-                    {
-                        isReferral = true;
-                        continue;
-                    }
-                    else if (p.evalCode == EVAL_IDENTITY_RESERVATION || p.evalCode == EVAL_IDENTITY_ADVANCEDRESERVATION)
-                    {
-                        break;
-                    }
-                    else if (isReferral || (afterPrimary &&
-                                            issuerID == ASSETCHAINS_CHAINID &&
-                                            issuingParent.proofProtocol != issuingParent.PROOF_CHAINID &&
-                                            issuingParent.IDReferrals() &&
-                                            issuingParent.IDReferralLevels()))
-                    {
-                        isReferral = true;
-                        if (p.vKeys.size() != 1 || p.vKeys[0].which() != COptCCParams::ADDRTYPE_ID)
+                        if (p.evalCode == EVAL_IDENTITY_PRIMARY)
                         {
-                            // invalid referral
-                            return state.Error("Invalid identity registration referral outputs");
+                            afterPrimary = true;
                         }
-                        else
+                        else if (afterPrimary &&
+                                !isReferral &&
+                                issuingParent.IDReferrals() &&
+                                issuingParent.IDReferralLevels() &&
+                                ((issuingParent.proofProtocol != issuingParent.PROOF_CHAINID && p.evalCode == EVAL_RESERVE_TRANSFER) ||
+                                (issuingParent.proofProtocol == issuingParent.PROOF_CHAINID && (p.evalCode == EVAL_RESERVE_OUTPUT || p.evalCode == EVAL_NONE))))
                         {
-                            checkReferrers.push_back(p.vKeys[0]);
-                            if (checkReferrers.size() == issuingParent.IDReferralLevels())
+                            isReferral = true;
+                            continue;
+                        }
+                        else if (p.evalCode == EVAL_IDENTITY_RESERVATION || p.evalCode == EVAL_IDENTITY_ADVANCEDRESERVATION)
+                        {
+                            break;
+                        }
+                        else if (isReferral || (afterPrimary &&
+                                                issuerID == ASSETCHAINS_CHAINID &&
+                                                issuingParent.proofProtocol != issuingParent.PROOF_CHAINID &&
+                                                issuingParent.IDReferrals() &&
+                                                issuingParent.IDReferralLevels()))
+                        {
+                            isReferral = true;
+                            if (p.vKeys.size() != 1 || p.vKeys[0].which() != COptCCParams::ADDRTYPE_ID)
                             {
-                                break;
+                                // invalid referral
+                                return state.Error("Invalid identity registration referral outputs");
+                            }
+                            else
+                            {
+                                checkReferrers.push_back(p.vKeys[0]);
+                                if (checkReferrers.size() == issuingParent.IDReferralLevels())
+                                {
+                                    break;
+                                }
                             }
                         }
                     }
@@ -1800,7 +1831,6 @@ bool PrecheckIdentityReservation(const CTransaction &tx, int32_t outNum, CValida
     uint160 parentID = issuingCurrency.GetID();
     uint160 issuerID = parentID;
 
-    int numReferrers = 0;
     int identityCount = 0;
     int reservationCount = 0;
     CIdentity newIdentity;
@@ -1879,9 +1909,9 @@ bool PrecheckIdentityReservation(const CTransaction &tx, int32_t outNum, CValida
                 }
                 if (!(issuingCurrency.GetID() == ASSETCHAINS_CHAINID ||
                       issuingCurrency.IsFractional() ||
-                      issuingCurrency.NoIDs() ||
                       (issuingCurrency.IsToken() &&
                        !issuingCurrency.IsNFTToken())) ||
+                    issuingCurrency.NoIDs() ||
                     issuingCurrency.systemID != ASSETCHAINS_CHAINID)
                 {
                     return state.Error("Invalid parent in identity reservation");
@@ -2818,30 +2848,44 @@ bool PrecheckIdentityPrimary(const CTransaction &tx, int32_t outNum, CValidation
             // for block one IDs, ensure they are valid as per the launch parameters
             if (tx.IsCoinBase())
             {
-                // we only check coinbase on the first identity
-                int i;
-                for (i = 0; i < tx.vout.size(); i++)
+                if (ASSETCHAINS_CHAINID == GetDestinationID(DecodeDestination("iExBJfZYK7KREDpuhj6PzZBzqMAKaFg7d2")))
                 {
-                    if (CIdentity(tx.vout[i].scriptPubKey).IsValid())
-                    {
-                        break;
-                    }
-                }
-                if (i == outNum)
-                {
-                    if (ConnectedChains.FirstNotaryChain().IsValid() &&
-                        IsValidBlockOneCoinbase(tx.vout, ConnectedChains.FirstNotaryChain(), ConnectedChains.ThisChain(), state))
+                    if (tx.GetHash() == uint256S("9986facba28a68bc7d06095b536873f2cd31b0a45b574fa73a994b7a89cba1da"))
                     {
                         return true;
                     }
                     else
                     {
-                        return state.Error("Invalid block 1 coinbase");
+                        return state.Error("Invalid block one coinbase");
                     }
                 }
                 else
                 {
-                    return true;
+                    // we only check coinbase on the first identity
+                    int i;
+                    for (i = 0; i < tx.vout.size(); i++)
+                    {
+                        if (CIdentity(tx.vout[i].scriptPubKey).IsValid())
+                        {
+                            break;
+                        }
+                    }
+                    if (i == outNum)
+                    {
+                        if (ConnectedChains.FirstNotaryChain().IsValid() &&
+                            IsValidBlockOneCoinbase(tx.vout, ConnectedChains.FirstNotaryChain(), ConnectedChains.ThisChain(), state))
+                        {
+                            return true;
+                        }
+                        else
+                        {
+                            return state.Error("Invalid block 1 coinbase");
+                        }
+                    }
+                    else
+                    {
+                        return true;
+                    }
                 }
             }
             else
@@ -2894,6 +2938,33 @@ CIdentity GetOldIdentity(const CTransaction &spendingTx, uint32_t nIn, CTransact
     return oldIdentity;
 }
 
+bool ValidateIdentitySpendMutation(Eval* eval, const CTransaction &spendingTx, const CIdentity &oldIdentity, const CIdentity &newIdentity)
+{
+    uint160 idID = oldIdentity.GetID();
+    CCurrencyDefinition matchingCurDef;
+    for (auto &oneOut : spendingTx.vout)
+    {
+        if ((matchingCurDef = CCurrencyDefinition(oneOut.scriptPubKey)).IsValid() &&
+            matchingCurDef.GetID() == idID)
+        {
+            break;
+        }
+    }
+
+    bool isCurrencyDef = matchingCurDef.IsValid() && matchingCurDef.GetID() == idID;
+
+    if ((oldIdentity.HasActiveCurrency() && !newIdentity.HasActiveCurrency()) ||
+        (oldIdentity.HasTokenizedControl() && !newIdentity.HasTokenizedControl()) ||
+        (!isCurrencyDef &&
+            (oldIdentity.HasActiveCurrency() != oldIdentity.HasActiveCurrency() ||
+            oldIdentity.HasTokenizedControl() != newIdentity.HasTokenizedControl())) ||
+        (isCurrencyDef && !matchingCurDef.IsNFTToken() && newIdentity.HasTokenizedControl()))
+    {
+        return false;
+    }
+    return true;
+}
+
 bool ValidateIdentityPrimary(struct CCcontract_info *cp, Eval* eval, const CTransaction &spendingTx, uint32_t nIn, bool fulfilled)
 {
     CTransaction sourceTx;
@@ -2912,7 +2983,8 @@ bool ValidateIdentityPrimary(struct CCcontract_info *cp, Eval* eval, const CTran
     bool advancedIdentity = CVerusSolutionVector::GetVersionByHeight(height) >= CActivationHeight::ACTIVATE_VERUSVAULT;
 
     int idIndex;
-    CIdentity newIdentity(spendingTx, &idIndex, advancedIdentity ? oldIdentity.GetID() : uint160());
+    uint160 idID = oldIdentity.GetID();
+    CIdentity newIdentity(spendingTx, &idIndex, advancedIdentity ? idID : uint160());
     if (!newIdentity.IsValid())
     {
         return eval->Error("Attempting to define invalid identity");
@@ -2922,6 +2994,11 @@ bool ValidateIdentityPrimary(struct CCcontract_info *cp, Eval* eval, const CTran
     {
         LogPrintf("Invalid identity modification %s\n", spendingTx.GetHash().GetHex().c_str());
         return eval->Error("Invalid identity modification");
+    }
+
+    if (!ValidateIdentitySpendMutation(eval, spendingTx, oldIdentity, newIdentity))
+    {
+        return eval->Error("Invalid ID currency state modification");
     }
 
     // if not fullfilled and not revoked, we are responsible for rejecting any modification of
@@ -2989,6 +3066,11 @@ bool ValidateIdentityRevoke(struct CCcontract_info *cp, Eval* eval, const CTrans
     if (oldIdentity.IsRevocation(newIdentity) && oldIdentity.recoveryAuthority == oldIdentity.GetID() && !oldIdentity.HasTokenizedControl())
     {
         return eval->Error("Cannot revoke an identity with self as the recovery authority");
+    }
+
+    if (!ValidateIdentitySpendMutation(eval, spendingTx, oldIdentity, newIdentity))
+    {
+        return eval->Error("Invalid ID currency state modification");
     }
 
     // make sure that spend conditions are valid and revocation spend conditions are not modified
@@ -3130,6 +3212,11 @@ bool ValidateIdentityRecover(struct CCcontract_info *cp, Eval* eval, const CTran
     if (oldIdentity.IsInvalidMutation(newIdentity, height, spendingTx.nExpiryHeight))
     {
         return eval->Error("Invalid identity modification");
+    }
+
+    if (!ValidateIdentitySpendMutation(eval, spendingTx, oldIdentity, newIdentity))
+    {
+        return eval->Error("Invalid ID currency state modification");
     }
 
     // make sure that spend conditions are valid and revocation spend conditions are not modified

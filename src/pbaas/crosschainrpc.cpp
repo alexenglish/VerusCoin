@@ -51,17 +51,11 @@ extern string PBAAS_USERPASS;
 extern int32_t PBAAS_PORT;
 extern std::string VERUS_CHAINNAME;
 
-uint32_t PBAAS_TESTFORK2_TIME = 1684281600;
-uint32_t PBAAS_TESTFORK3_TIME = 1685379600;
-uint32_t PBAAS_TESTFORK4_TIME = 1686416400;
-uint32_t PBAAS_TESTFORK5_TIME = 1687042800;
-uint32_t PBAAS_TESTFORK6_TIME = 1687994100;
-uint32_t PBAAS_TESTFORK7_TIME = 1688799600;
-
 uint32_t PBAAS_MAINDEFI3_HEIGHT = 2553500;
 uint32_t PBAAS_CLEARCONVERT_HEIGHT = 2588590;
-uint32_t PBAAS_LASTKNOWNCLEARORACLE_HEIGHT = 2597525;
+uint32_t PBAAS_LASTKNOWNCLEARORACLE_HEIGHT = 3210000;
 uint32_t PBAAS_ENFORCE_CORRECT_EVIDENCE_TIME = 1684359650;
+uint32_t PBAAS_OPTIMIZE_ETH_HEIGHT = 2805000;
 
 //
 // Exception thrown on connection error.  This error is used to determine
@@ -251,7 +245,7 @@ UniValue RPCCallRoot(const string& strMethod, const UniValue& params, int timeou
         {
             PBAAS_USERPASS = userIt->second[0] + ":" + passIt->second[0];
             PBAAS_PORT = atoi(portIt->second[0]);
-            PBAAS_HOST = hostIt == settingsmulti.end() ? hostIt->second[0] : "127.0.0.1";
+            PBAAS_HOST = hostIt != settingsmulti.end() ? hostIt->second[0] : "127.0.0.1";
             if (!PBAAS_HOST.size())
             {
                 PBAAS_HOST = "127.0.0.1";
@@ -745,7 +739,21 @@ CCurrencyDefinition::CCurrencyDefinition(const UniValue &obj) :
 
         if (IsPBaaSChain() || IsGateway() || IsGatewayConverter())
         {
-            gatewayConverterIssuance = AmountFromValueNoErr(find_value(obj, "gatewayconverterissuance"));
+            UniValue gatewayIssuanceUni = find_value(obj, "gatewayconverterissuance");
+            if (!gatewayIssuanceUni.isNull())
+            {
+                try
+                {
+                    gatewayConverterIssuance = AmountFromValue(gatewayIssuanceUni);
+                }
+                catch(const std::exception& e)
+                {
+                    LogPrintf("%s: invalid gatewayconverterissuance %s\n", __func__, gatewayIssuanceUni.write().c_str());
+                    nVersion = PBAAS_VERSION_INVALID;
+                    return;
+                }
+            }
+
             if (IsGatewayConverter())
             {
                 std::string gatewayNameID = uni_get_str(find_value(obj, "gateway"));
@@ -864,7 +872,21 @@ CCurrencyDefinition::CCurrencyDefinition(const UniValue &obj) :
             if (IsFractional())
             {
                 preLaunchDiscount = AmountFromValueNoErr(find_value(obj, "prelaunchdiscount"));
-                initialFractionalSupply = AmountFromValueNoErr(find_value(obj, "initialsupply"));
+
+                UniValue initSupplyUni = find_value(obj, "initialsupply");
+                if (!initSupplyUni.isNull())
+                {
+                    try
+                    {
+                        initialFractionalSupply = AmountFromValue(initSupplyUni);
+                    }
+                    catch(const std::exception& e)
+                    {
+                        LogPrintf("%s: invalid initialsupply %s\n", __func__, initSupplyUni.write().c_str());
+                        nVersion = PBAAS_VERSION_INVALID;
+                        return;
+                    }
+                }
 
                 if (!initialFractionalSupply)
                 {
@@ -1080,7 +1102,7 @@ CCurrencyDefinition::CCurrencyDefinition(const UniValue &obj) :
 
                 CTxDestination preallocDest = DecodeDestination(preallocationKey[0]);
 
-                if (preallocDest.which() != COptCCParams::ADDRTYPE_ID && preallocDest.which() != COptCCParams::ADDRTYPE_INVALID)
+                if (preallocDest.which() != COptCCParams::ADDRTYPE_ID && (preallocationArr.size() == 1 && preallocDest.which() != COptCCParams::ADDRTYPE_INVALID))
                 {
                     LogPrintf("%s: preallocation destination must be an identity\n", __func__);
                     nVersion = PBAAS_VERSION_INVALID;
@@ -1090,7 +1112,7 @@ CCurrencyDefinition::CCurrencyDefinition(const UniValue &obj) :
                 CAmount preAllocAmount = AmountFromValueNoErr(preallocationValue[0]);
                 if (preAllocAmount <= 0)
                 {
-                    LogPrintf("%s: preallocation values must be greater than zero\n", __func__);
+                    LogPrintf("%s: invalid preallocation values must be greater than zero and less than 10 billion\n", __func__);
                     nVersion = PBAAS_VERSION_INVALID;
                     break;
                 }
@@ -1149,7 +1171,20 @@ CCurrencyDefinition::CCurrencyDefinition(const UniValue &obj) :
 
         if (!gatewayID.IsNull())
         {
-            gatewayConverterIssuance = AmountFromValueNoErr(find_value(obj, "gatewayconverterissuance"));
+            UniValue gatewayIssuanceUni = find_value(obj, "gatewayconverterissuance");
+            if (!gatewayIssuanceUni.isNull())
+            {
+                try
+                {
+                    gatewayConverterIssuance = AmountFromValue(gatewayIssuanceUni);
+                }
+                catch(const std::exception& e)
+                {
+                    LogPrintf("%s: invalid gatewayconverterissuance %s\n", __func__, gatewayIssuanceUni.write().c_str());
+                    nVersion = PBAAS_VERSION_INVALID;
+                    return;
+                }
+            }
         }
 
         auto vEras = uni_getValues(find_value(obj, "eras"));
@@ -1179,7 +1214,8 @@ CCurrencyDefinition::CCurrencyDefinition(const UniValue &obj) :
             catch(const std::exception& e)
             {
                 LogPrintf("%s: Invalid initial target, must be 256 bit hex target\n", __func__);
-                throw e;
+                nVersion = PBAAS_VERSION_INVALID;
+                return;
             }
 
             blockTime = uni_get_int64(find_value(obj, "blocktime"), DEFAULT_BLOCKTIME_TARGET);
@@ -1203,6 +1239,11 @@ CCurrencyDefinition::CCurrencyDefinition(const UniValue &obj) :
 
             for (auto era : vEras)
             {
+                CAmount oneReward = uni_get_int64(find_value(era, "reward"));
+                if (oneReward > (100000LL * COIN))
+                {
+                    LogPrintf("%s: block reward out of range %ld - %ld\n", __func__, 0, (100000LL * COIN));
+                }
                 rewards.push_back(uni_get_int64(find_value(era, "reward")));
                 rewardsDecay.push_back(uni_get_int64(find_value(era, "decay")));
                 halving.push_back(uni_get_int64(find_value(era, "halving")));
@@ -1300,7 +1341,7 @@ CCurrencyDefinition::CCurrencyDefinition(const std::string &currencyName, bool t
             UniValue uniEra1(UniValue::VOBJ);
             uniEra1.pushKV("reward", 600000000);
             uniEra1.pushKV("decay", 0);
-            uniEra1.pushKV("halving", 1051922);
+            uniEra1.pushKV("halving", 1051924);
             uniEra1.pushKV("eraend", 0);
             uniEras.push_back(uniEra1);
 
@@ -1324,7 +1365,12 @@ int64_t CCurrencyDefinition::GetTotalPreallocation() const
     CAmount totalPreallocatedNative = 0;
     for (auto &onePreallocation : preAllocation)
     {
-        totalPreallocatedNative += onePreallocation.second;
+        if (!MoneyRange(onePreallocation.second) ||
+            !MoneyRange(totalPreallocatedNative += onePreallocation.second))
+        {
+            totalPreallocatedNative = INT64_MAX;
+            break;
+        }
     }
     return totalPreallocatedNative;
 }
@@ -1335,6 +1381,20 @@ int64_t CCurrencyDefinition::CalculateRatioOfValue(int64_t value, int64_t ratio)
     static const arith_uint256 bigSatoshi(SATOSHIDEN);
 
     int64_t retVal = ((bigAmount * arith_uint256(ratio)) / bigSatoshi).GetLow64();
+    return retVal;
+}
+
+int64_t CCurrencyDefinition::CalculateRatioOfTwoValues(int64_t value1, int64_t value2)
+{
+    arith_uint256 bigAmount(value1);
+    static const arith_uint256 bigSatoshi(SATOSHIDEN);
+
+    if (!value2)
+    {
+        value2 = 1;
+    }
+
+    int64_t retVal = ((bigAmount * bigSatoshi) / arith_uint256(value2)).GetLow64();
     return retVal;
 }
 

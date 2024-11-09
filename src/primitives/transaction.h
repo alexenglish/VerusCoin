@@ -240,7 +240,6 @@ public:
     JSDescription(): vpub_old(0), vpub_new(0) { }
 
     JSDescription(
-            bool makeGrothProof,
             ZCJoinSplit& params,
             const uint256& joinSplitPubKey,
             const uint256& rt,
@@ -253,7 +252,6 @@ public:
     );
 
     static JSDescription Randomized(
-            bool makeGrothProof,
             ZCJoinSplit& params,
             const uint256& joinSplitPubKey,
             const uint256& rt,
@@ -1373,7 +1371,7 @@ public:
 
     // this validates that all parts of a transaction match and either returns a full transaction
     // and its hash, a partially filled transaction and its MMR root, or NULL
-    uint256 CheckPartialTransaction(CTransaction &outTx, bool *pIsPartial=nullptr) const;
+    uint256 CheckPartialTransaction(CTransaction &outTx, bool *pIsPartial=nullptr, bool optimizedETH=true) const;
 
     bool IsBlockPreHeader() const
     {
@@ -1520,7 +1518,7 @@ public:
     std::vector<unsigned char> signature;
 
     CSmartTransactionSignature() : sigType(SIGTYPE_NONE) {}
-    CSmartTransactionSignature(uint8_t sType, const std::vector<unsigned char> &pkData, const std::vector<unsigned char> &sig) : sigType(sType), pubKeyData(pubKeyData), signature(sig) {}
+    CSmartTransactionSignature(uint8_t sType, const std::vector<unsigned char> &pkData, const std::vector<unsigned char> &sig) : sigType(sType), pubKeyData(pkData), signature(sig) {}
     CSmartTransactionSignature(uint8_t sType, const CPubKey &pk, const std::vector<unsigned char> &sig) : sigType(sType), pubKeyData(pk.begin(), pk.end()), signature(sig) {}
     CSmartTransactionSignature(const std::vector<unsigned char> &asVector)
     {
@@ -1703,18 +1701,6 @@ public:
     template <typename Stream, typename Operation>
     inline void SerializationOp(Stream& s, Operation ser_action) {
         READWRITE(*(COutPoint *)this);
-    }
-
-    static std::string UtxoReferenceKeyName()
-    {
-        return "vrsc::system.utxo.reference";
-    }
-
-    static uint160 UtxoReferenceKey()
-    {
-        static uint160 nameSpace;
-        static uint160 signatureKey = CVDXF::GetDataKey(UtxoReferenceKeyName(), nameSpace);
-        return signatureKey;
     }
 
     bool IsValid() const

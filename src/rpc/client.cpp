@@ -1152,7 +1152,7 @@ UniValue CCurrencyDefinition::ToUniValue() const
 CTransferDestination CTransferDestination::GetAuxDest(int destNum) const
 {
     CTransferDestination retVal;
-    if (auxDests.size() < destNum)
+    if (destNum >= 0 && destNum < auxDests.size())
     {
         ::FromVector(auxDests[destNum], retVal);
         if (retVal.type & FLAG_DEST_AUX || retVal.auxDests.size())
@@ -1180,7 +1180,12 @@ int64_t CCurrencyDefinition::GetTotalPreallocation() const
     CAmount totalPreallocatedNative = 0;
     for (auto &onePreallocation : preAllocation)
     {
-        totalPreallocatedNative += onePreallocation.second;
+        if (!MoneyRange(onePreallocation.second) ||
+            !MoneyRange(totalPreallocatedNative += onePreallocation.second))
+        {
+            totalPreallocatedNative = INT64_MAX;
+            break;
+        }
     }
     return totalPreallocatedNative;
 }
@@ -1534,6 +1539,21 @@ CNodeData::CNodeData(std::string netAddr, std::string paymentAddr) :
 {
 }
 
+// returns 1 object or none if no valid, recognize object at front of stream
+template <typename Stream> UniValue CIdentity::VDXFDataToUniValue(Stream &ss, bool *pSuccess)
+{
+    if (pSuccess)
+    {
+        *pSuccess = false;
+    }
+    return UniValue(UniValue::VNULL);
+}
+
+UniValue CIdentity::VDXFDataToUniValue(const std::vector<unsigned char> &dataVch)
+{
+    return UniValue(UniValue::VNULL);
+}
+
 CIdentityID CIdentity::GetID(const std::string &Name, uint160 &parent)
 {
     std::string cleanName = CleanName(Name, parent);
@@ -1631,6 +1651,7 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "getbalance", 2 },
     { "getcurrencybalance", 1},
     { "getcurrencybalance", 2},
+    //{ "getcurrencyconverters", 0},
     { "getblockhash", 0 },
     { "move", 2 },
     { "move", 3 },
@@ -1769,6 +1790,7 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "setidentitytimelock", 1},
     { "recoveridentity", 0},
     { "signdata", 0},
+    { "decryptdata", 0},
     { "verifysignature", 0},
     { "getidentitieswithaddress", 0},
     { "getidentitieswithrevocation", 0},
